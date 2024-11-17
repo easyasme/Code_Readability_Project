@@ -60,7 +60,7 @@ def collect_code_snippets(max_files=10):
                     file_name = f'code_snippet_{total_collected}.py'
                     file_path = os.path.join(output_directory, file_name)
                     
-                    with open(file_path, 'w') as f:
+                    with open(file_path, 'w', encoding='utf-8') as f:
                         f.write(code)
 
                     print(f'Collected {total_collected} files: {file_name}')
@@ -76,4 +76,4 @@ def collect_code_snippets(max_files=10):
     print(f'Total code snippets collected: {total_collected}')
 
 if __name__ == '__main__':
-    collect_code_snippets(max_files=10)
+    collect_code_snippets(max_files=500)
