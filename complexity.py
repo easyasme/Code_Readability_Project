@@ -8,9 +8,8 @@ def get_complexity(snippet):
     ccresults = radon.complexity.cc_visit(snippet)
     # Get the CC score of each function in the snippet
     complexities = [result.complexity for result in ccresults]
-    # Return the average
-    avg_score = sum(complexities) / len(complexities)
-    return avg_score
+    # Return the average, or 0 if there are no functions
+    return sum(complexities) / len(complexities) if len(complexities) else 0
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
