@@ -18,7 +18,7 @@ if __name__ == '__main__':
             with zipfile.ZipFile(zfile, 'r') as zip_ref:
                 zip_ref.extractall("temp_dest")
 
-            data = [["#", "Style Guide Adherence", "Variable Name Quality"]]
+            data = [["#", "Style Guide Adherence", "Variable Name Quality", "Complexity Score"]]
             for root, dirs, files in os.walk("temp_dest"):
                 py_files = [x for x in files if x.endswith('py')]
                 for i, file in enumerate(py_files):
@@ -27,13 +27,13 @@ if __name__ == '__main__':
                         print(f"Processing file: {file_path}")
 
                         adherence_score = style_guide_adherence.style_adherence(file_path)
+                        complexity_score = complexity.get_complexity(file_path) or '?'
                         with open(file_path, 'r') as file:
                             content = file.read()
                             var_name_score = name_quality.calculate_quality(content)
                             #commnet_ratio = comment_ratio.get_ratio(content)
-                            #complexity_score = complexity.get_complexity(content)
 
-                        result = [i, adherence_score, var_name_score]
+                        result = [i, adherence_score, var_name_score, complexity_score]
                         data.append(result)
 
             output_file = "code_readability.csv"
