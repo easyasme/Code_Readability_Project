@@ -20,10 +20,10 @@ def get_complexity(filepath: str):
 		ccresults = radon.complexity.cc_visit(snippet)
 	except SyntaxError as e:
 		filename = os.path.basename(filepath)
-		print(f"SyntaxError in {filename}: {e}")
+		# print(f"SyntaxError in {filename}: {e}")
 		try:
 			# Syntax error in the code snippet. It might be python2 code, so we try to convert it to python3
-			subprocess.run(["2to3", filepath, "-n", "-W", "-o", temp_dir])
+			subprocess.run(["2to3", filepath, "-n", "-W", "-o", temp_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 			converted_filepath= os.path.join(temp_dir, filename)
 			with open(converted_filepath, 'r') as file:
 				snippet = file.read()
