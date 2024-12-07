@@ -56,6 +56,7 @@ if __name__ == '__main__':
 
             shutil.rmtree("temp_dest")
             shutil.rmtree("converted_files")
+            shutil.rmtree("complexity_temp")
             
         except FileNotFoundError:
             print(f"Error: The file '{sys.argv[1]}' was not found.")
