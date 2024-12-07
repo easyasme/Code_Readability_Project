@@ -1,6 +1,7 @@
 import sys
 from os import path
 import re
+import ast
 import statistics
 import keyword
 from spellchecker import SpellChecker
@@ -8,7 +9,7 @@ import spacy
 from itertools import combinations
 
 def calculate_quality(snippet):
-    variable_names = get_variable_names(snippet)
+    variable_names = get_variable_names(snippet) + get_function_names(snippet)
 
     if len(variable_names) != 0:
         valid_names_score = calculate_valid_name_score(variable_names) # 1. Check whether it is a valid Python name
@@ -30,8 +31,15 @@ def get_variable_names(snippet):
     matches = re.findall(pattern, snippet, flags=re.MULTILINE)
 
     result = [item[0] for item in list(set(matches))]
-
     return result  # Remove duplicates
+
+def get_function_names(snippet):
+    tree = ast.parse(snippet)
+    
+    # Extract function names
+    function_names = [node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
+    function_names = list(set(function_names))
+    return function_names
 
 def calculate_valid_name_score(variable_names):
     valid_names = [
