@@ -9,14 +9,14 @@ def get_ratio(snippet):
 
 def classify_ratio(ratio):
     """
-    - Good: 15% <= ratio < 25%
-    - Medium: 0% <= ratio < 15% or 25% <= ratio < 40%
+    - Good: 15% <= ratio < 30%
+    - Medium: 0% <= ratio < 15% or 30% <= ratio < 40%
     - Bad: 40% <= ratio < 60%
     - Very Bad: ratio >= 60%
     """
-    if 0.15 <= ratio < 0.25:
+    if 0.15 <= ratio < 0.30:
         return "Good"
-    elif 0 <= ratio < 0.15 or 0.25 <= ratio < 0.4:
+    elif 0 <= ratio < 0.15 or 0.30 <= ratio < 0.4:
         return "Medium"
     elif 0.4 <= ratio < 0.6:
         return "Bad"
