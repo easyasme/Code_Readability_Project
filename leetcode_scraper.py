@@ -11,8 +11,9 @@ RANGE = 100 # Number of solutions to get from each question
 
 # Mapping of question IDs to submission IDs
 QUESTIONS = {
-	146: 1471406520, # LRU Cache
-	355: 1471395746, # Design Twitter
+	# 146: 1471406520, # LRU Cache
+	# 295: 1472222305, # Find Median from Data Stream
+	# 355: 1471395746, # Design Twitter
 }
 
 output_dir = "leetcode_samples"
