@@ -1,0 +1,193 @@
+#!/usr/bin/env python
+from __future__ import print_function
+import os, sys, stat
+import argparse
+import functools
+import shlex
+from operator import itemgetter
+
+from quickfind.Searcher import Searcher, Ranker, CursesPrinter
+from quickfind.Orderer import STOrderer, auto_select
+import quickfind.Console as Console
+from quickfind.source.DirectorySource import DirectorySource, ranker, dirFormatter
+from quickfind.source.CtagsSource import CtagsSource, CtagsRanker, CtagsFormatter
+from quickfind.source.Util import rec_dir_up, StringRanker, simpleFormatter
+
+EDITOR = os.environ.get('EDITOR', 'nano')
+
+class Runner(object):
+    def __init__(self, args):
+        self.rows, self.columns = Console.getDims()
+        self.args = args
+
+    def find(self):
+        raise NotImplementedError()
+
+    def get_orderer(self):
+        if self.args.st:
+            return STOrderer
+
+        return functools.partial(auto_select, procs=self.args.mt)
+
+class DirRun(Runner):
+
+    def find(self):
+
+        git_ignore = self.args.g
+        dirs = []
+        for p in self.args.paths:
+            if os.path.isfile(p):
+                p = os.path.split(p)[0]
+            if os.path.isdir(p):
+                dirs.append(p)
+
+        DirSource = functools.partial(DirectorySource, dirs=dirs, git_ignore=git_ignore)
+        if self.args.fileType == 'all':
+            ds = DirSource(ignore_directories=False, ignore_files=False)
+        elif self.args.fileType == 'files':
+            ds = DirSource(ignore_files=False)
+        else:
+            ds = DirSource(ignore_directories=False)
+
+        items = ds.fetch()
+
+        sr = ranker(self.args.p)
+        s = Searcher(CursesPrinter(dirFormatter), self.args.multiselect)
+        orderer = self.get_orderer()
+        try:
+            found = s.run(orderer(sr, items), self.args.q)
+        except KeyboardInterrupt:
+            sys.exit(0)
+
+        return [os.path.join(f.dir, f.name) for f in found]
+
+class StdinRun(Runner):
+    def fetch(self):
+        results = []
+        for i, line in enumerate(sys.stdin):
+            results.append((i, line.strip()))
+
+        # reopen stdin
+        f = open("/dev/tty")
+        os.dup2(f.fileno(), 0)
+        return results
+
+    def find(self):
+
+        items = self.fetch()
+        sr = StringRanker.new(get_part=itemgetter(1))
+        output = CursesPrinter(lambda x,q,d: simpleFormatter(x[1], q,d))
+        s = Searcher(output, self.args.multiselect)
+        orderer = self.get_orderer()
+        try:
+            found = s.run(orderer(sr, items), self.args.q)
+        except KeyboardInterrupt:
+            sys.exit(0)
+
+        return [f[1] for f in found]
+
+class CtagsRun(Runner):
+
+    def find(self):
+        ctagsFile = self.find_ctag_file()
+        if ctagsFile is None:
+            print("Could not find ctags file")
+            sys.exit(1)
+
+        items = CtagsSource(ctagsFile).fetch()
+        s = Searcher(CursesPrinter(CtagsFormatter(self.columns)))
+        orderer = self.get_orderer()
+        try:
+            found = s.run(orderer(CtagsRanker, items), self.args.q)
+        except KeyboardInterrupt:
+            sys.exit(0)
+
+        if found:
+            found = found[0]
+            if self.args.f == DEFAULT_COMMAND and found.pattern.isdigit():
+                self.args.f = '%s +{2} {1}' % EDITOR
+            elif self.args.f == DEFAULT_COMMAND:
+                self.args.f = '%s {1}' % EDITOR
+
+            return ["%s %s" % (found.file, found.pattern)]
+
+    def find_ctag_file(self):
+        directory = os.path.abspath(self.args.paths[0])
+        for dir in rec_dir_up(directory):
+            path = os.path.join(dir, "tags")
+            if os.path.isfile(path):
+                return path
+
+        return None
+
+DEFAULT_COMMAND = "%s {0}" % EDITOR
+
+def build_arg_parser():
+    parser = argparse.ArgumentParser(description='A Fuzzy-finder for the terminally inclined')
+    parser.add_argument("paths", metavar="PATH", nargs="*", default=['.'],
+            help="Paths to search.  If omitted, uses current working directory")
+    parser.add_argument('-c', 
+            action="store_true", help='Ctags quickfind')
+    parser.add_argument('-g', 
+            action="store_false", help='Do not filter out files in .gitignore')
+    parser.add_argument('-p', 
+            action="store_true", help='Match also on path')
+    parser.add_argument('-q', default="",
+            help='Preseeds the query with the provided provided string')
+    parser.add_argument('-f', default=DEFAULT_COMMAND,
+            help="Format of the output.  When the '-o' flag is provided, defaults to " \
+                 "'{1}'.  When File mode is specified, executes '$EDITOR {0}'.")
+    parser.add_argument('-D', dest='delim', default=None,
+            help="Delimiter for {}-style parsing.")
+    parser.add_argument('-o', dest='stdout', action="store_true",
+            help="Writes the selection to stdout")
+    parser.add_argument('-m', dest="multiselect", action="store_true",
+            help="Enables multiple selections.")
+    parser.add_argument("-T", dest="record_delimiter", default="\n",
+            help="Default record delimiter for multiple selections")
+    parser.add_argument("-st", dest="st", action="store_true",
+            help="Use single threaded mode rather than smart multiprocessing")
+    parser.add_argument("-mt", dest="mt", type=int, default=6,
+            help="Maximum number of forks to use")
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-d', action="store_const", dest="fileType", const="dirs",
+                        help='Directories only.')
+    group.add_argument('-a', action="store_const", dest="fileType", const="all",
+                        help='Both files and directories.')
+    parser.set_defaults(fileType="files")
+
+    return parser.parse_args()
+
+def isPiped():
+    mode = os.fstat(sys.stdin.fileno()).st_mode
+    return  stat.S_ISFIFO(mode) or stat.S_ISREG(mode)
+
+def main():
+    args = build_arg_parser()
+    args.stdin = isPiped()
+    if args.stdout and args.f == DEFAULT_COMMAND:
+        args.f = "{0}"
+
+    if args.c:
+        runner = CtagsRun(args)
+    elif args.stdin:
+        runner = StdinRun(args)
+    else:
+        runner = DirRun(args)
+
+    items = runner.find()
+    if items:
+        its = [item.split(args.delim) for item in items]
+        tots = args.record_delimiter.join(items)
+        ts = [args.record_delimiter.join(s) for s in zip(*its)]
+        formatted = args.f.format(tots, *ts)
+        f = os.path.expandvars(formatted)
+        if args.stdout:
+            print(f)
+        else:
+            pieces = shlex.split(f)
+            os.execvp(pieces[0], pieces)      
+
+if __name__ == '__main__':
+    main()

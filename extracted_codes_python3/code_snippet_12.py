@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+
+import argparse
+import time
+import importlib
+import sys
+
+import os
+from fnmatch import fnmatch
+
+#List of functions that are required to be implemented in any submodules
+REQUIRED_FUNC_NAMES = ['run', 'info', 'init']
+
+def parse_args():
+    """
+    Parse CLI args and enable a --help document
+    """
+    parser = argparse.ArgumentParser(description="Resource Harvester")
+    parser.add_argument('-l', '--list', action="store_true",
+                        help='List all available modules and their descriptions')
+    parser.add_argument('-i', '--inputs', nargs='+', default=['timestamp', 'cpu', 'mem'],
+                        help='Space-separated list of input modules to use')
+    parser.add_argument('-o', '--outputs', nargs=1, default=['json'],
+                        help='Output module to use (default is JSON). Currently, only 1 output is supported')
+    parser.add_argument('-t', '--interval', type=float, default=1.0,
+                        help='Number of seconds between harvest/print cycles')
+    args = parser.parse_args()
+    return args
+
+def get_modules(module_types, module_args):
+    """
+    Programmatically verify and import list of modules (also called libraries in Python) as specified by arguments:
+    module_types - array with types of module (i.e. 'inputs' or 'outputs'). Corresponds with folder modules are in. For now, an array with a single value is the most appropriate argument (i.e. ['inputs'])
+    module_args - names of individual modules to import from module_types folder(s)
+
+    This function also confirms the presence of required module functions specified by REQUIRED_FUNC_NAMES
+    Returns list of imported modules
+    """
+    modules = []
+    modules_error = False
+    for mt in module_types:
+        for i in module_args:
+            try:
+                # For each module, import it, test it for required functionality
+                # and append to list of modules
+                # If an error occurs, print it to screen and exit
+                m = importlib.import_module(mt + '.' + i)
+                for fn in REQUIRED_FUNC_NAMES:
+                    if callable(getattr(m, fn, None)) is False:
+                        print('Module ' + m.__name__ + ' must implement function ' + fn)
+                        modules_error = True
+                        pass
+                m.init()
+                modules.append(m)
+            except Exception:
+                print("Error importing input module", i)
+                raise Exception
+                modules_error = True
+        if modules_error:
+            sys.exit(0)
+    return modules
+
+def m_name(module):
+    """
+    Get the name of module without the prefix
+    """
+    m = module.__name__
+    return m[m.find('.')+1:]
+
+def print_info(module_dir):
+        for file in os.listdir(module_dir):
+            if fnmatch(file, '*.py') and not fnmatch(file, '__init__.py'):
+                m = importlib.import_module(module_dir + '.' + file[:file.index('.')])
+                print("  " + m_name(m) + ' - ' + m.info())
+
+def main():
+    args = parse_args()
+
+    # Import list of input and output modules as specified by command-line args
+    inputs = get_modules(['inputs'], args.inputs)
+    outputs = get_modules(['outputs'], args.outputs)
+
+    if args.list is True:
+        print("Input modules:")
+        print_info('inputs')
+        print("\n")
+        print("Output modules:")
+        print_info('outputs')
+        sys.exit(0)
+    while True:
+        out = {}
+        # TODO: Make interval more predictable (i.e. 1 second interval starts on the second)
+        time.sleep(args.interval)
+        
+        # TODO: Figure out how to remove "inputs." from module name
+        # Gather data from all inputs
+        for m in inputs:
+            out[m_name(m)] = m.run()
+
+        # Process input data through output function
+        output = outputs[0].run(out)
+        print(output)
+
+if __name__ == "__main__":
+    main()

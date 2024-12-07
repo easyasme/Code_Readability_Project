@@ -1,0 +1,200 @@
+#!/usr/bin/python
+
+import json
+import os
+import sys
+import time
+
+from datetime import datetime, date, timedelta
+from os.path import join, isdir, isfile, splitext, basename, exists, realpath, dirname
+
+
+CONFIG_PATH = join(os.getenv('XDG_CONFIG_HOME'), 'tt') if os.getenv('XDG_CONFIG_HOME') else join(os.getenv('HOME'), '.config', 'tt')
+
+DEFAULT_CONFIG = {
+        'tmp_file': join(os.getenv('HOME'), 'tmp', '.timetracker'),
+        'base_dir': join(os.getenv('HOME'), 'var', 'nextcloud', 'misc', 'timetracker'),
+        'strf_string': '%H:%M',
+        'statuses': {
+            's': 'sick',
+            'v': 'vacation',
+            'csd': 'child-sick-day',
+            'wd': 'weekday',
+            'we': 'weekend'},
+        'worktime': {
+            'hours': 8,
+            'minutes': 0},
+        'delta_minutes': 0,
+    }
+
+quarters = {
+        1: [1,2,3],
+        2: [1,2,3],
+        3: [1,2,3],
+        4: [4,5,6],
+        5: [4,5,6],
+        6: [4,5,6],
+        7: [7,8,9],
+        8: [7,8,9],
+        9: [7,8,9],
+       10: [10,11,12],
+       11: [10,11,12],
+       12: [10,11,12]
+    }
+
+
+def usage():
+    print(f'Usage: {basename(sys.argv[0])} <0|1|e|t|s <s|v>|d [iso-date]|w [weeknum year]>|n <note>')
+    sys.exit(1)
+
+
+def err(msg: str):
+    print(f'[!] {msg}')
+    sys.exit(1)
+
+
+def read_config():
+    if not isfile(CONFIG_PATH): return {}
+    with open(CONFIG_PATH) as config_file:
+        return json.load(config_file)
+
+
+class Day():
+    times = []
+    status = None
+
+    def __init__(self, date: date):
+        self.date = date
+        self.path = join(config['base_dir'], self.date.strftime('%Y-%m'), f'{self.date.isoformat()}.md')
+        self.status = config['statuses']['wd' if self.date.weekday() < 5 else 'we']
+
+        if isfile(self.path):
+            try:
+                datedict = json.load(open(self.path))
+                self.times = self._read_times(datedict)
+                self.status = datedict.get('status')
+                self.note = datedict.get('note')
+            except:
+                pass
+
+    def _read_times(self, datedict):
+        times = datedict.get('times')
+        datetimes = [datetime.fromisoformat(f'{self.date}T{t}:00') for t in times]
+        return datetimes
+
+    def _log(self, delta_minutes=0):
+        self.times.append(datetime.now() + timedelta(minutes=delta_minutes))
+
+    def start_log(self):
+        if isfile(config['tmp_file']):
+            err('already logging')
+        os.mknod(config['tmp_file'])
+        self._log(-int(config['delta_minutes']))
+        self.store()
+
+    def stop_log(self):
+        if not isfile(config['tmp_file']):
+            err('not logging')
+        self._log(int(config['delta_minutes']))
+        os.remove(config['tmp_file'])
+        self.store()
+
+    def set_status(self, status):
+        self.status = config['statuses'][status]
+        self.store()
+
+    def set_note(self, note: str):
+        self.note = note
+        self.store()
+
+    def elapsed_time(self):
+        tmp_times = self.times.copy()
+        if len(self.times) % 2 and self.date == date.today():
+            tmp_times.append(datetime.now())
+        return sum((end - start for (start, end) in zip(tmp_times[0::2], tmp_times[1::2])), timedelta())
+
+    def total_seconds(self):
+        return self.elapsed_time().total_seconds()
+
+    def store(self, path=None):
+        used_dir = os.path.dirname(os.path.realpath(self.path))
+
+        if not isdir(used_dir):
+            os.makedirs(used_dir)
+        print(self._dict())
+        json.dump(self._dict(), open(self.path, 'w'))
+
+    def edit(self):
+        if not isfile(self.path):
+            err(f'No file for {self.date}')
+        os.system(f'{os.getenv("EDITOR")} {self.path}')
+
+    def _dict(self):
+        return {'date': self.date.isoformat(),
+                'times': [dt.strftime(config['strf_string']) for dt in self.times],
+                'status': self.status,
+                'note': self.note}
+
+    def __str__(self):
+        return json.dumps(self._dict(), sort_keys=True)
+
+
+def matches_iso_date(string: str):
+    try:
+        return date.fromisoformat(string)
+    except:
+        err('No iso format given')
+
+
+def print_time(sec: int):
+    sign = '-' if sec < 0 else ''
+    hours = int(sec/3600)
+    minutes = int((sec - hours*3600) / 60)
+    print(f'{sign}{abs(hours)}h {abs(minutes):02d}m')
+
+
+def all_dates():
+    return [date.fromisoformat((splitext(f)[0])) for _,_,files in os.walk(config['base_dir']) for f in files if matches_iso_date(splitext(f)[0])]
+
+
+def seconds(days: list):
+    total_seconds = sum([d.total_seconds() for d in days])
+    return total_seconds
+
+
+def total(timerange: list):
+    worktime = timedelta(hours=config['worktime']['hours'], minutes=config['worktime']['minutes'])
+    total_seconds = seconds(timerange) - sum([worktime for d in timerange if d.status == 'weekday'], timedelta()).total_seconds()
+    return total_seconds
+
+
+if __name__ == '__main__':
+    config = {**DEFAULT_CONFIG, **read_config()}
+
+    if len(sys.argv) < 2:
+        print_time(total([Day(d) for d in all_dates() if d.month in quarters[date.today().month] and d.year == date.today().year]))
+    elif sys.argv[1] == '0':
+        Day(date.today()).stop_log()
+    elif sys.argv[1] == '1':
+        Day(date.today()).start_log()
+    elif sys.argv[1] == 'e':
+        Day(date.today()).edit()
+    elif sys.argv[1] == 't':
+        print_time(total([Day(d) for d in all_dates() if d.month in quarters[date.today().month] and d.year == date.today().year]))
+    elif sys.argv[1] == 's':
+        if len(sys.argv) < 3 or sys.argv[2] not in ['s', 'v']:
+            usage()
+        Day(date.today()).set_status(sys.argv[2])
+    elif sys.argv[1] == 'd':
+        arg = seconds([Day(date.today())]) if len(sys.argv) < 3 else seconds([Day(matches_iso_date(sys.argv[2]))])
+        print_time(arg)
+    elif sys.argv[1] == 'w':
+        arg = (date.today().isocalendar()[1], date.today().year) if len(sys.argv) < 3 else (int(sys.argv[2]), int(sys.argv[3]))
+        print_time(seconds([Day(d) for d in all_dates() if (d.isocalendar()[1], d.year) == arg]))
+    elif sys.argv[1] == 'n':
+        if not len(sys.argv) > 2:
+            usage()
+        Day(date.today()).set_note(' '.join(sys.argv[2:]))
+    else:
+        usage()
+

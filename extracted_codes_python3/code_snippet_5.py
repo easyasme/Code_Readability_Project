@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+
+#/*******************************************************************************
+# Copyright (c) 2012 IBM Corp.
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#/*******************************************************************************
+
+'''
+    Created on Aug 22, 2011
+
+    CloudBench Command Processor Command Line Interface
+
+    @author: Marcio Silva, Michael R. Galaxy 
+'''
+
+from sys import stdout, path, argv
+from subprocess import Popen, PIPE
+from pwd import getpwuid
+
+from lib.auxiliary.config import get_available_clouds, get_version
+
+import os
+import re
+import threading
+import readline
+
+def main() :
+    '''
+    Before parsing the config files, see if there are
+    any executable CLI commands buried at the end of the
+    argument list, which don't include "-" or "--" in the arguments.
+    If so, this means the user intends for cloudbench to execute
+    those commands and exit quietly.
+    '''
+
+    threading.current_thread().abort = False
+    _command_found = True 
+    for _possible_command in argv :
+        if _possible_command.count("-") :
+            _command_found = False 
+            break
+
+    _path = re.compile(".*\/").search(os.path.realpath(__file__)).group(0)
+    _history = os.path.expanduser("~") + "/.cb_history"
+    _3rd_party = _path + "/3rd_party"
+
+    _version = get_version(_path)
+
+    _name = _path.split('/')[-2].capitalize()
+    print(str(_name) + " version is \"" + str(_version.decode("utf-8")) + "\"")
+
+    if not os.path.exists(_3rd_party) :
+        os.mkdir(_3rd_party)
+
+    from lib.auxiliary.cli import CBCLI
+    _cmd_processor = CBCLI()
+    options = _cmd_processor.options
+
+    if not os.path.exists(_history) :
+        from lib.auxiliary.dependencies import dependency_checker_installer
+        _msg = "Looks like this is the first time that CloudBench is executed"
+        _msg += " on this node. Will check for dependencies..."
+        print(_msg)
+
+        _status, _msg = dependency_checker_installer("127.0.0.1", getpwuid(os.getuid())[0], "configure", options)
+        if _status :
+            print(_msg)
+            print("\n Please add the missing dependency(ies) and re-run configure again.")
+            exit(_status)
+    
+    _args = _cmd_processor.args
+
+    _initial_command = ""
+    if len(_args) > 0 :
+        for _arg in _args :
+            _initial_command += _arg + " "
+        _initial_command = _initial_command[:-1]
+
+    _cmd_processor.setup_logging(options)
+
+    if options.soft_reset or options.hard_reset :
+        from lib.stores.stores_initial_setup import reset
+        _msg = "Executing \"" + ("hard" if options.hard_reset else "soft")
+        _msg += "\" reset: (killing all running toolkit processes"
+        _msg += " and flushing stores) before starting the experiment......"
+        print(_msg)
+        _default_cloud_to_flush = None
+        if options.soft_reset_cloud == "startup_cloud" :
+            if "startup_cloud" in _cmd_processor.cld_attr_lst["user-defined"] :
+                _default_cloud_to_flush = _cmd_processor.cld_attr_lst["user-defined"]["startup_cloud"]
+        else :
+            _default_cloud_to_flush = options.soft_reset_cloud
+        if _default_cloud_to_flush is not None :
+            _default_cloud_to_flush = _default_cloud_to_flush.lower()
+            available_clouds = get_available_clouds(_cmd_processor.cld_attr_lst, return_all_options = True)
+            found = False
+            for cloud in available_clouds :
+                if _cmd_processor.cld_attr_lst["user-defined"]["startup_cloud"].lower() == _default_cloud_to_flush :
+                    found = True
+                    break
+
+            if found :
+                print("Only flush registered cloud: " + _default_cloud_to_flush.upper())
+            else :
+                print("Error: " + _default_cloud_to_flush.upper() + " not found.")
+                exit(1)
+        
+        _status, _msg = reset(_cmd_processor.cld_attr_lst, soft = False if options.hard_reset else True, cloud_name = _default_cloud_to_flush)
+        if not _status :
+            _msg = "\"" + ("Hard" if options.hard_reset else "Soft")
+            _msg += "\" reset executed successfully."
+        else : 
+            print("Error:" + _msg)
+            exit()
+
+    _cmd_processor.start_api_and_gui()
+
+    _cmd_processor.do_cldlist("", False)
+
+    # Handle the new multi-cloud configuration system
+    if "startup_cloud" in _cmd_processor.cld_attr_lst["user-defined"] :
+        available_clouds = get_available_clouds(_cmd_processor.cld_attr_lst, return_all_options = True)
+        for cloud in available_clouds :
+            if _cmd_processor.cld_attr_lst["user-defined"]["startup_cloud"].lower() == cloud :
+                for _command in available_clouds[cloud] :
+                    _command = _command.replace("__COMMA__",',').strip()
+                    print("\n ############################# Executing command \"" + _command + "\" (specified on the configuration file) \n")
+                    _cmd_processor.onecmd(_command)
+                    if _command.count("cldattach") :
+                        _cmd_processor.do_clddefault(cloud.upper())
+    else :
+        # Or do it the old way
+        for command in get_available_clouds(_cmd_processor.cld_attr_lst) :
+            _cmd_processor.onecmd(command)
+
+    if _initial_command != "" :
+
+        for _command in _initial_command.split(",") :
+            _command = _command.replace("__COMMA__",',').strip()
+            print("\n ############################# Executing command \"" + _command + "\" (specified on the command line) \n")
+            _cmd_processor.onecmd(_command)
+    else :
+        if options.tracefile :
+            if options.tracefile[0] != "/" :
+                options.tracefile = path[0] + "/" + options.tracefile
+            _msg = "Loading trace file commands from: " + options.tracefile
+            print (_msg)
+
+            with open(options.tracefile) as f:
+                _cmd_processor.cmdqueue.extend(f.read().splitlines())
+
+        while True :
+            try :
+                _cmd_processor.cmdloop()
+                break
+            except KeyboardInterrupt :
+                print ("CTRL-D or quit to exit")
+    readline.write_history_file(_history + ".tmp")
+    _history_fh = open(_history + ".tmp")
+    _history_contents = _history_fh.read()
+    _history_fh.close()
+    _history_fh = open(_history, 'w')
+    _history_fh.write(_history_contents)
+    _history_fh.close()
+    
+main()

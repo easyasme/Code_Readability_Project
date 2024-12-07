@@ -1,0 +1,409 @@
+#!/usr/bin/env python
+import re
+import os
+import sys
+import time
+import asyncio
+import subprocess
+import numpy as np
+import pandas as pd
+import os.path as osp
+import logging as log
+from collections import defaultdict
+from abc import ABC, abstractmethod
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit import PromptSession
+import matplotlib.pyplot as plt
+from prompt_toolkit.shortcuts.prompt import CompleteStyle
+
+class Config:
+    def __init__(self):
+        self.mpl_settings = "/tmp/kp-mpl.txt"
+        self.plot_name="/tmp/kp-name.txt"
+        self.runlist = "/tmp/runlist.txt"
+        self.plot_file = "/tmp/kp.png"
+        with open(self.mpl_settings, "w") as f:
+            f.write("")
+        self.px = 1/plt.rcParams['figure.dpi']  # pixel in inches
+        self.xtick_col = "step"
+
+class State:
+    def __init__(self, runs, keys):
+        self.old_matches = []
+        self.matches = []
+        self.runs = runs
+        self.keys = keys
+        self.old_text = ""
+        self.text = ""
+
+
+    def get_matches(self, text):
+        self.old_text = self.text
+        self.text = text
+        return list(filter(lambda x: re.match(text, x), self.keys))
+
+    def update_matches(self, text):
+        self.old_matches = self.matches.copy()
+        self.matches = self.get_matches(text)
+        return self.new_matches()
+
+    def new_matches(self):
+        return self.old_matches != self.matches
+
+import numpy as np
+import matplotlib.pyplot as plt
+from multiprocessing import Pool
+from math import ceil, sqrt
+import array, fcntl, termios # for get_terminal_size
+import io
+from copy import deepcopy
+from PIL import Image
+
+# https://towardsdatascience.com/plotting-in-parallel-with-matplotlib-and-python-f7efb3d944de
+def rasterize(fig):
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight')
+    buf.seek(0)
+    pil_img = deepcopy(Image.open(buf))
+    buf.close()
+    return pil_img
+
+def get_terminal_size():
+    buf = array.array('H', [0, 0, 0, 0])
+    fcntl.ioctl(1, termios.TIOCGWINSZ, buf)
+    return buf[2], buf[3]
+
+def apply_settings_before_plot(cfg):
+    # run mpl commands before plotting
+    plt.style.use(["dark_background", "fast"])
+    with open(cfg.mpl_settings) as f:
+        for line in f:
+            line = line.strip().split()
+            if line[0] == "style":
+                if line[1] == "light":
+                    plt.style.use(["classic", "fast"])
+
+def apply_settings_to_ax(cfg, ax):
+    with open(cfg.mpl_settings) as f:
+        for line in f:
+            line = line.strip().split()
+            if len(line) not in (1, 2, 3):
+                continue
+            
+            if line[0] == "ylog":
+                ax.set_yscale('log')
+            if line[0] == "xmin":
+                ax.set_xlim(max(ax.get_xlim()[0],float(line[1])))
+            elif line[0] == "ymin":
+                ax.set_ylim(max(ax.get_ylim()[0],float(line[1])))
+            elif line[0] == "xmax":
+                ax.set_xlim(None, min(ax.get_xlim()[1],float(line[1])))
+            elif line[0] == "ymax":
+                ax.set_ylim(None, min(ax.get_ylim()[1],float(line[1])))
+            elif line[0] == "legend":
+                ax.legend(loc=" ".join(line[1:])) 
+
+def plot(cfg, ax, metrics: dict, metric: str, label, show_legend: bool = True):
+    if metric not in metrics.keys():
+        return
+    if cfg.xtick_col in metrics.keys():
+        xs = metrics[cfg.xtick_col]
+    else:
+        xs = list(range(len(metrics[metric])))
+    ax.plot(xs, metrics[metric], label=label, linewidth=4)
+
+    # Skip processing plot statistics if there are none
+    if not metric.endswith("_mean"):
+        ax.set_title(metric)
+        return
+    ax.set_title(metric[:-5])
+    # plot shaded area between min and max of metric
+    min_met = metric[:-5]+"_min"
+    max_met = metric[:-5]+"_max"
+    std_met = metric[:-5]+"_std"
+    ax.fill_between(xs,
+                    metrics[min_met],
+                    metrics[max_met],alpha=0.2)
+    if std_met not in metrics.keys():
+        return
+    # plot std if exists
+
+    std_mins = [max(_min, mean-sqrt(std)) for _min, mean, std in 
+            zip(metrics[min_met], metrics[metric], metrics[std_met])]
+    std_maxes = [min(_max, mean+sqrt(std)) for _max, mean, std in 
+            zip(metrics[max_met], metrics[metric], metrics[std_met])]
+    ax.fill_between(xs, std_mins, std_maxes, alpha=0.2) 
+    if show_legend:
+        ax.legend(loc="upper left")
+
+def compute_num_rows_and_cols(num_metrics: int):
+    """Determines the size of the graph grid"""
+    if num_metrics % 2 == 0 and num_metrics % 6 != 0:
+        num_cols = 2
+    else:
+        num_cols = min(num_metrics, 3)
+    num_rows = ceil(num_metrics / num_cols)
+    return num_rows, num_cols
+
+def get_ax(axes, i, num_rows, num_cols):
+    """Gets axis i from matrix of axes"""
+    r, c = i // num_cols, i % num_cols
+    ax = 0
+    # matplotlib doesn't make 2d grid a dimension is len 1
+    if num_cols==1:
+        ax = axes
+    elif num_rows==1:
+        ax = axes[c]
+    else:
+        ax = axes[r,c]
+    return ax
+
+def _plot_worker(cfg, runs_to_plot, runs: dict, metric: str):
+    show_legend = len(runs) > 1
+    fig, ax = plt.subplots()
+    apply_settings_before_plot(cfg)
+    
+    for run in runs_to_plot:
+        label = None if len(runs) < 2 else run
+        plot(cfg, ax, runs[run], metric, label)
+    if show_legend:
+        ax.legend(loc="upper left")
+    apply_settings_to_ax(cfg, ax)
+    pil_img = rasterize(fig)
+    plt.close()
+    return pil_img
+
+# Image generation
+def make_grid(cfg, s: State, unfiltered_metrics: list):
+    if len(unfiltered_metrics) == 0:
+        print("no metrics")
+        return None
+    unfiltered_metrics.sort()
+    metrics = [m for m in unfiltered_metrics if not m.endswith("_min") and not m.endswith("_max") and not m.endswith("_std")]
+    
+    num_rows, num_cols = compute_num_rows_and_cols(len(metrics))
+    # users can change visible runs by commenting or deleting lines in runlist
+    with open(cfg.runlist) as f:
+        runs_to_plot = [r.strip() for r in f.readlines() if not r.startswith("#")]
+
+
+    size = get_terminal_size()
+    xsize = (size[0]*cfg.px) - 1
+    ysize = (size[1]*cfg.px) - 1 if num_rows <= 2 else ((num_rows * size[1]*cfg.px)/2) - 1
+
+    _, axes = plt.subplots(num_rows, num_cols, figsize=(xsize, ysize))
+    apply_settings_before_plot(cfg)
+    axes = np.array(axes)
+    worker_args = [(cfg, runs_to_plot, s.runs, met) for met in metrics]
+    # Multiprocessing hangs on laptop
+    # with Pool(len(metrics)) as pool:
+    #     for ax, rastered in zip(axes.ravel(), pool.starmap(_plot_worker, worker_args)):
+    #         ax.imshow(rastered)
+    for ax, rastered in zip(axes.ravel(), [_plot_worker(*args) for args in worker_args]):
+        ax.imshow(rastered)
+            
+    # Hide all ax ticks including empty ones, which are ignored by ^
+    for ax in axes.ravel():
+        ax.get_xaxis().set_ticks([])
+        ax.get_yaxis().set_ticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+    
+    plt.subplots_adjust(hspace=0, wspace=0)
+    return 1
+
+def update_and_draw_grid(s: State):
+    if len(s.matches) == 0:
+        return
+    os.system("clear")
+    plt.clf()
+    grid = make_grid(cfg, s, [metric for metric in s.matches])
+    if grid is not None:
+        plt.savefig(cfg.plot_file, format="png", bbox_inches="tight", pad_inches=0)
+        os.system(f"kitten icat --unicode-placeholder {cfg.plot_file}")
+        plt.close("all")
+        print()
+
+bindings = KeyBindings()
+EDITOR = os.environ.get("EDITOR", "vim")
+@bindings.add('?')
+def _(event):
+    subprocess.run(f"{EDITOR} {cfg.mpl_settings}".split())
+    update_and_draw_grid(s)
+    event.app.exit()
+
+@bindings.add('\'')
+def _(event):
+    subprocess.run(f"{EDITOR} {cfg.runlist}".split())
+    update_and_draw_grid(s)
+    event.app.exit()
+
+@bindings.add('/')
+def _(event):
+    with open(cfg.plot_name, "w") as f:
+        f.write("")
+    subprocess.run(f"{EDITOR} {cfg.plot_name}".split())
+    with open(cfg.plot_name) as f:
+        name = f.read().strip()
+        if name:
+            plt.savefig(name, format="png")
+            print("plot saved to", name)
+    event.app.exit()
+
+class RegexCompleter(Completer):
+    def get_completions(self, document, complete_event):
+        matches = s.get_matches(document.text)
+        for match in matches:
+            if any(match.endswith(s) for s in "_min _max _std".split()):
+                continue
+            if match.endswith("_mean"):
+                yield Completion(match[:-5], start_position=-len(document.text))
+                continue
+            yield Completion(match, start_position=-len(document.text))
+
+class AbstractLoader(ABC):
+    @abstractmethod
+    def getfile(self, filename):
+        pass
+    
+    @abstractmethod
+    def read(self, file):
+        pass
+    
+    @abstractmethod
+    def load(self, data):
+        pass
+
+class CSVLoader(AbstractLoader):
+    def getfile(self, filename):
+        metrics_file = osp.join(osp.join("", filename),"metrics.csv")
+        results_file = osp.join(osp.join("", filename),"results.txt")
+        if osp.exists(metrics_file):
+            return metrics_file
+        elif osp.exists(results_file): 
+            return results_file
+        else:
+            return False
+
+    async def read(self, file):
+        return pd.read_csv(file)
+
+    def load(self, filename: str, futures, labels, runlist: str):
+        try:
+            label = osp.basename(osp.dirname(filename))
+            futures.append(self.read(filename))
+            labels.append(label)
+
+            # bug: all runs will appear after reload
+            with open(runlist, "a") as f:
+                f.write(f"{label}\n")
+        except:
+            raise OSError(f"Could not read {filename}")
+
+
+class LogLoader(AbstractLoader):
+    """Loads log files into a dict of metrics, matches fp values indicated by |val| and by |min, mean ± std, max|"""
+    float_re = r"([-+]?[0-9]*\.?[0-9]+)"
+    mmms_re = re.compile(f".* (.+): \|{float_re}, {float_re} ± {float_re}, {float_re}\|")
+    single_re = re.compile(f".* (.+): \|{float_re}\|")
+    STATS = "_min _mean _std _max".split()
+
+    def match(self, regex, line):
+        m = re.match(regex, line)
+        if m and all(m.groups()):
+            return m
+        return False
+
+    def add_metric(self, metrics: defaultdict, line):
+        """collects all metrics in line and adds them
+        to metrics dict"""
+        if m := self.match(self.mmms_re, line):
+            met, *vals = m.groups()
+            assert len(vals) == len(self.STATS)
+            for s, v  in zip(self.STATS, vals):
+                metrics[met+s].append(float(v))
+        elif m := self.match(self.single_re, line):
+            met, vals = m.groups()
+            metrics[met].append(float(vals))
+
+    async def read(self, file: str):
+        """Reads log data into metrics"""
+        metrics = defaultdict(list)
+        with open(file) as f:
+            for line in f:
+                self.add_metric(metrics, line)
+        return metrics
+
+    def load(self, filename, futures, labels, runlist):
+        """creates an async req to read log data
+        and adds the log name to the list of labels"""
+        label = osp.basename(filename)
+        if label.endswith(".log"):
+            label = label[:-4]
+        futures.append(self.read(filename))
+        labels.append(label)
+
+        with open(runlist, "a") as f:
+            f.write(f"{label}\n")
+
+    def getfile(self, filename: str):
+        """returns filename if a valid logfile, else False"""
+        if not filename.endswith(".log"):
+            return False
+        metrics_file = filename
+        if osp.exists(metrics_file):
+            return metrics_file
+
+
+async def load(runlist: str):
+    log.debug("loading data")
+    global runs, keys, matches
+    with open(runlist, "w") as f:
+        f.write("")
+    runs = {}
+    keys = None
+    labels, futures = [], []
+    read_file = False
+    loaders = [CSVLoader(), LogLoader()]
+    for arg in sys.argv[1:]:
+        for loader in loaders:
+            if filename := loader.getfile(arg):
+                read_file = True
+                loader.load(filename, futures, labels, runlist)
+    if not read_file:
+        print(f"ERROR: could not read {sys.argv[1:]}")
+    run_data = await asyncio.gather(*futures)
+    assert len(labels) == len(run_data)
+    runs = dict(zip(labels, run_data))
+    keys = list(set().union(*[v.keys() for v in runs.values()]))
+    state = State(runs, keys)
+    return state
+
+async def main(cfg: Config, s: State):
+    session = PromptSession( key_bindings=bindings, completer=RegexCompleter(),
+                           complete_style=CompleteStyle.READLINE_LIKE)
+
+    while True:
+        try:
+            time.sleep(0.1)
+            text = await asyncio.wait_for(session.prompt_async('> ', vi_mode=True,  default='.*'), timeout=30)
+        except KeyboardInterrupt:  # Ctrl-C
+            continue
+        except EOFError:           # Ctrl-D
+            break
+        except asyncio.TimeoutError:
+            print("\r" + " "*40, end="")
+            await load(cfg.runlist)
+            update_and_draw_grid(s)
+        else:
+            if text and s.update_matches(text):
+                update_and_draw_grid(s)
+
+global s, cfg # prompt toolkit seems to like globals
+cfg = Config()
+
+if __name__ == '__main__':
+    cfg = Config()
+    s = asyncio.run(load(cfg.runlist))
+    asyncio.run(main(cfg, s))

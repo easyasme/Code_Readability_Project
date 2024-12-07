@@ -1,0 +1,353 @@
+#!/usr/bin/env python
+from __future__ import (absolute_import, division,
+                        print_function)
+from future.builtins import *
+import os, re, string, sys
+from datetime import datetime
+import numpy as np
+import pandas as pd
+import argparse
+import warnings
+import logging
+warnings.simplefilter(action = "ignore")
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--prefix', action='store', default=None,
+                    help='prefix all columns names\nFor example: --prefix set1_')
+parser.add_argument('--suffix', action='store', default=None,
+                    help='sufix all columns names\nFor example: --suffix _set1')
+parser.add_argument('-c', '--columns', action='store', default=None,
+                    help='comma-delimited column names to output')
+parser.add_argument('-C', '--counts', action='store', default=None,
+                    help='comma-delimited column names to output as value counts')
+parser.add_argument('-X', '--crosstab', action='store', default=None,
+                    help=('field names as rows: field names as columns\nuse comma-delimited names\nexample: c1,c2:c4,c5')
+                    )
+parser.add_argument('-P', '--pivot', action='store', default=None,
+                    help=('field names as rows:columns:values\nuse comma-delimited names\nexample: c1,c2:c4:c5')
+                    )
+parser.add_argument('-e', '--eval', action='append', default=[],
+                    help='py code to apply to dataframe')
+parser.add_argument('-p', '--predicate', action='append', default=[],
+                    help='predicate (filter) to apply to dataframe')
+parser.add_argument('-q', '--query', action='store', default=[],
+                    help='query to apply to dataframe')
+parser.add_argument('--sep', action='store', default=',',
+                    help='csv separator')
+parser.add_argument('--out-sep', action='store', default='',
+                    help='output separator (overrides --sep for output)')
+parser.add_argument('-f', '--func', action='append', default=[],
+                    help='function to apply to dataframe')
+parser.add_argument('--csv', action='append', default=[],
+                    help='extra dataframes to load from csv')
+parser.add_argument('-n', '--no-header', action='store_true',
+                    help='suppress header line with field names')
+parser.add_argument('-l', '--lowercase-header', action='store_true',
+                    help='lowercase field names in header line.  Also switches spaces to underscores.')
+parser.add_argument('-r', '--rename', action='append', default=[],
+                    help='rename column using oldname,newname')
+parser.add_argument('-a', '--astype', action='append', default=[],
+                    help='set column as type: colname,type\nexample: -a expense,float')
+parser.add_argument('--sql', action='store_true',
+                    help='get sql from stdin and pull from database')
+parser.add_argument('--pg', action='store', default=None,
+                    help='dsn for postgresql connection.  Use empty string to pull from environment')
+parser.add_argument('--mysql', action='store', default=None,
+                    help='dsn for mysql connection.  Use empty string to pull from environment')
+parser.add_argument('--excel', action='store_true',
+                    help='get excel from stdin')
+parser.add_argument('cmd', action='store', nargs='?',
+                    help='command to exec')
+parser.add_argument("-v", "--verbose", action="count", default=0,
+                    help="increases log verbosity for each occurence.")
+parser.add_argument("-s", "--silent", action="count", default=0,
+                    help="decreases log verbosity for each occurence.")
+parser.add_argument('-i', '--show-index', action='store_true',
+                    help='include index in output')
+parser.add_argument('-T','--transpose', action='store_true',
+                    help='transpose output and include index')
+parser.add_argument('-t','--table', action='store_true',
+                    help='ascii table output in markdown pipe-style')
+parser.add_argument('--join', action='append', default=[],
+                    help=('join dataframe to another dataframe.  Format is:\n'
+                          ' csvfilename,how,fieldname'
+                          ' If fieldname is missing, use natural join.'
+                          ' If how is missing, use left join.'))
+parser.add_argument('--fill-blank', action='append', default=[],
+                    help=('Fill blank and None values with new value. Format is:\n'
+                          ' columnname,somevalue'))
+parser.add_argument('--fill', action='append', default=[],
+                    help=('Fill column with given value. Create column if not present.\n'
+                          'Format is: columnname,somevalue'))
+args = parser.parse_args()
+loglevel = min(max(3 - args.verbose + args.silent, 0), 5) * 10 # Between 0 and 50
+logging.basicConfig(format='%(asctime)s:%(levelname)s:%(message)s', level=loglevel)
+
+func = []
+for mf in args.func:
+    mfparts = mf.strip().split('.')
+    m, f_all = mfparts[:-1], mfparts[-1]
+    fparts = f_all.split('(')
+    f, raw_functor_args = fparts[0], '('.join(fparts[1:])
+    if raw_functor_args:
+        try:
+            a = raw_functor_args[:-1]
+            if a:
+                functor_args = eval(a)
+            else:
+                functor_args = None
+        except:
+            raise Exception('ERROR: could not parse functor "%s"' % mf)
+    module_name = '.'.join(m)
+    function_name = f
+    mod = __import__(module_name)
+    newfunc = getattr(mod, function_name)
+    if raw_functor_args:
+        if functor_args:
+            func.append(newfunc(functor_args))
+        else:
+            func.append(newfunc())
+    else:
+        func.append(newfunc)
+clean_str = lambda s: str(s).strip()
+force_str = {i:clean_str for i in range(1000)}
+con = None
+
+if args.mysql is not None:
+    import MySQLdb
+    dsnp = [a.split('=') for a in args.mysql.split()]
+    dsn = {}
+    for k, v in dsnp:
+        if k == 'dbname':  # Allow postgresql-style dsn keys for mysql
+            k = 'db'
+        if k == 'port':
+           v = int(v)
+        dsn[k] = v
+    con = MySQLdb.connect(**dsn)
+
+if args.pg is not None:
+    import psycopg2
+    con = psycopg2.connect(args.pg)
+
+if args.sql:
+    if con is None:
+        logging.info('Database argument not found, assuming PostgreSQL')
+        import psycopg2
+        con = psycopg2.connect('')
+    #df = pd.io.sql.read_frame(sys.stdin.read(), con)
+    df = pd.read_sql(sys.stdin.read(), con, coerce_float=False)
+    #idcols = [c for c in df.columns if c == 'id' or c.endswith('_id')]
+    #logging.error(idcols)
+    # for c in idcols:
+    #     df[c] = df[c].astype(str)
+    #     df[c] = df[c].replace('\.0$', '', regex=True)
+    #     logging.error(c)
+    #logging.error(df)
+    con.close()
+elif args.excel:
+    paths = sys.stdin.read().strip().split('\n')
+    logging.debug('excel paths: %r', paths)
+    dflist = []
+    orig_fh = sys.stdout
+    sys.stdout = sys.stderr
+    for p in paths:
+        dflist.append(pd.read_excel(p, 0))
+    sys.stdout = orig_fh
+    df = pd.concat(dflist, keys=[os.path.basename(p).lower() for p in paths])
+else:
+    read_opts = dict(
+        sep = args.sep,
+        converters = force_str,
+    )
+    df = pd.read_csv(sys.stdin, **read_opts)
+
+if args.lowercase_header:
+    df.rename(columns=dict(
+        (c, c.lower().replace(' ','_')) for c in df.columns),
+        inplace=True)
+
+if args.prefix:
+    for c in df.columns:
+        df.rename(columns={c:args.prefix+c}, inplace=True)
+
+if args.suffix:
+    for c in df.columns:
+        df.rename(columns={c:c+args.suffix}, inplace=True)
+
+for oldnew in args.rename:
+    oldcol, newcol = oldnew.split(',')
+    df.rename(columns={oldcol:newcol}, inplace=True)
+
+for coltype in args.astype:
+    colname, newtype = coltype.split(',')
+    df[colname] = df[colname].astype(newtype)
+
+def load_df(fname):
+    opts = {}
+    if fname.endswith('.gz'):
+        opts['compression'] = 'gzip'
+    with open(fname) as fin:
+        return pd.read_csv(fin, converters=force_str, **opts)
+
+for j in args.join:
+    jj = j.split(',')
+    jfile = jj[0]
+    try:
+        jhow = jj[1]
+    except IndexError:
+        jhow = 'left'
+    try:
+        jfield = jj[2] or None
+    except IndexError:
+        jfield = None
+    try:
+        jfield2 = jj[3] or None
+    except IndexError:
+        jfield2 = None
+    jdf = load_df(jfile)
+    if jfield2:
+        df = pd.merge(df, jdf, on=[jfield,jfield2], how=jhow, suffixes=['','_new'])
+    else:
+        df = pd.merge(df, jdf, on=jfield, how=jhow, suffixes=['','_new'])
+
+for b in args.fill_blank:
+    bfield, bvalue = b.split(',')
+    df[bfield] = df[bfield].fillna(bvalue)
+
+for b in args.fill:
+    bfield, bvalue = b.split(',')
+    df[bfield] = bvalue
+
+xf = []
+for fname in args.csv:
+    xf.append(load_df(fname))
+
+for f in func:
+    df = f(df)
+
+for p in args.predicate:
+    df = pd.DataFrame(df.ix[eval(p)])
+
+if args.query:
+    df = df.query(args.query)
+
+for pycode in args.eval:
+    df = eval(pycode)
+
+if args.cmd:
+    exec(args.cmd)
+
+if args.counts:
+    raw_cols = [c.strip() for c in args.counts.split(',')]
+    try:
+        # See if the columns were listed as integers
+        # This allows -c '0,-1' to reference the first (0), and last (-1) columns
+        cols = [int(c) for c in raw_cols]
+    except:
+        # Use the string names
+        cols = raw_cols
+    df = df.groupby(cols).size().reset_index()
+    df.rename(columns={0:'count'}, inplace=True)
+
+if args.crosstab:
+    rr, cc = args.crosstab.split(':')
+    raw_rows = [r.strip() for r in rr.split(',')]
+    raw_cols = [c.strip() for c in cc.split(',')]
+    try:
+        # See if the columns were listed as integers
+        # This allows -c '0,-1' to reference the first (0), and last (-1) columns
+        cols = [int(c) for c in raw_cols]
+    except:
+        # Use the string names
+        cols = raw_cols
+    try:
+        # See if the columns were listed as integers
+        # This allows -c '0,-1' to reference the first (0), and last (-1) columns
+        rows = [int(r) for r in raw_rows]
+    except:
+        # Use the string names
+        rows = raw_rows
+        #nrow = [i for i,v in enumerate(rows)]
+    rlist = [df[r] for r in rows]
+    clist = [df[c] for c in cols]
+    df = pd.crosstab(rlist, clist, dropna=False, margins=True)
+    df.index.name = args.crosstab
+    df = df.reset_index()
+
+if args.pivot:
+    rr, cc, vv = args.pivot.split(':')
+    raw_rows = [r.strip() for r in rr.split(',')]
+    raw_cols = [c.strip() for c in cc.split(',')]
+    raw_vals = [c.strip() for c in vv.split(',')]
+    try:
+        # See if the columns were listed as integers
+        cols = [int(c) for c in raw_cols]
+    except:
+        # Use the string names
+        cols = raw_cols
+    try:
+        # See if the columns were listed as integers
+        rows = [int(r) for r in raw_rows]
+    except:
+        # Use the string names
+        rows = raw_rows
+        #nrow = [i for i,v in enumerate(rows)]
+    try:
+        # See if the value columns were listed as integers
+        vals = [int(r) for r in raw_rows]
+    except:
+        # Use the string names
+        vals = raw_vals
+
+    df = pd.pivot_table(df, rows=rows, cols=cols, values=vals, aggfunc=np.sum, dropna=False)
+    df = df.reset_index()
+    # unpack column names: (cols_name, cols_value) => cols_value
+    df.columns = ["_".join(rows)] + [c[-1] for c in df.columns[1:]]
+
+if type(df) == type(pd.Series()):
+    df = pd.DataFrame(df)
+
+if args.columns:
+    raw_cols = [c.strip() for c in args.columns.split(',')]
+    try:
+        # See if the columns were listed as integers
+        # This allows -c '0,-1' to reference the first (0), and last (-1) columns
+        cols = [int(c) for c in raw_cols]
+    except:
+        # Use the string names
+        cols = raw_cols
+    df = df[cols]
+
+if args.transpose:
+    df = df.T
+    args.show_index = True
+
+if not df.index.name:
+    df.index.name = 'index'
+
+if args.table:
+    from tabulate import tabulate
+    if args.no_header:
+        cols = None
+    else:
+        cols = [c for c in df.columns]
+    rs = df.to_records(index=args.show_index)
+    rsout = tabulate(rs, cols, tablefmt="pipe")
+    try:
+        print(rsout)
+    except IOError as x:
+        # IOError: [Errno 32] Broken pipe
+        if x.errno != 32:
+            raise
+    sys.exit(0)
+try:
+    write_opts = dict(
+        index = args.show_index,
+        header = not args.no_header,
+        sep = args.out_sep or args.sep,
+    )
+    df.to_csv(sys.stdout, **write_opts)
+except IOError as x:
+    # IOError: [Errno 32] Broken pipe
+    if x.errno != 32:
+        raise
