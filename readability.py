@@ -58,8 +58,10 @@ if __name__ == '__main__':
                         id = int(match.group())
 
                         try:
-                            adherence_score = '?' if style_guide_adherence.style_adherence(file_path) < 0 else style_guide_adherence.style_adherence(file_path)
-                            complexity_score = complexity.get_complexity(file_path) or '?'
+                            adherence_score = style_guide_adherence.style_adherence(file_path)
+                            adherence_score = '?' if adherence_score < 0 else adherence_score
+                            complexity_score = complexity.get_complexity(file_path)
+                            complexity_score = '?' if complexity_score == None else complexity_score
                             max_line = maxlinesfeature.max_lines(file_path)
                             readability = readability_score.get_readability(file_path)
                             with open(file_path, 'r') as file:
