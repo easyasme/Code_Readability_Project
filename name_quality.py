@@ -18,7 +18,7 @@ def calculate_quality(snippet):
             avg_similarity_score = calculate_names_lexical_similarity(valid_words) # 4. Calculate pairwise similarity
         else:
             avg_similarity_score = 1
-
+        
         return (valid_names_score + name_lengths_score + valid_words_score + avg_similarity_score)/4
    
     return 0
@@ -53,12 +53,21 @@ def calculate_spelling_score(variable_names):
     valid_words = []
     invalid_words = []
     for name in variable_names:
-        split_name = [word for word in re.split(r'[\._]+|(?=[A-Z])', name) if word]
+        split_name = []
+
+        for word in re.split(r'[\._]+', name):
+            if word:
+                if not word.isupper():
+                    split_name.extend(re.findall(r'[A-Z][^A-Z]*', word))
+                else:
+                    split_name.append(word)
+
         for word in split_name:
             if word in spell:
                 valid_words.append(word)
             else:
                 invalid_words.append(word)
+
     return len(valid_words)/len(variable_names), valid_words
 
 def calculate_names_lexical_similarity(valid_words):
