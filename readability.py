@@ -4,7 +4,6 @@ import re
 import csv
 import zipfile
 import shutil
-import subprocess
 
 import style_guide_adherence
 import name_quality
@@ -12,29 +11,6 @@ import comment_ratio
 import complexity
 import maxlinesfeature
 import readability_score
-
-def check_py2(file):
-    try:
-        # Run 2to3 command with the -l option to list Python 2 syntax
-        result = subprocess.run(
-            ["2to3", "-l", file],
-            capture_output=True,  # Capture the output
-            text=True  # Ensure the output is returned as a string
-        )
-        
-        # Check if the command was successful
-        if result.returncode == 0:
-            filename = os.path.basename(file)
-            subprocess.run(
-                ["2to3", file, "-n", "-W", "-o", "converted_files"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL)
-            converted_filepath= os.path.join("converted_files", filename)
-            return converted_filepath
-        else:
-            return file
-    except FileNotFoundError:
-        print("The `2to3` tool is not installed or not in your PATH.")
 
 if __name__ == '__main__':
     if len(sys.argv) > 1:
@@ -50,7 +26,6 @@ if __name__ == '__main__':
                 for file in py_files:
                     if file.endswith(".py"):
                         file_path = os.path.join(root, file)
-                        file_path = check_py2(file_path)
 
                         print(f"Processing file: {file_path}")
 
@@ -67,20 +42,21 @@ if __name__ == '__main__':
                             with open(file_path, 'r') as file:
                                 content = file.read()
                                 var_name_score = name_quality.calculate_quality(content)
-                                commnet_ratio = comment_ratio.get_ratio(content)
+                                ratio = comment_ratio.classify_ratio(comment_ratio.get_ratio(content))
 
-                            result = [id, adherence_score, var_name_score, complexity_score, max_line, commnet_ratio, readability]
+                            result = [id, adherence_score, var_name_score, complexity_score, max_line, ratio, readability]
                             data.append(result)
                         except Exception as e:
                             print(f"Error processing file {file_path}: {e}")
                             continue
-            output_file = "code_readability2.csv"
+            output_file = "code_readability.csv"
             with open(output_file, mode="w", newline="", encoding="utf-8") as file:
                 writer = csv.writer(file)
                 writer.writerows(data)
 
             shutil.rmtree("temp_dest")
             shutil.rmtree("converted_files")
+            shutil.rmtree("complexity_temp")
             
         except FileNotFoundError:
             print(f"Error: The file '{sys.argv[1]}' was not found.")
