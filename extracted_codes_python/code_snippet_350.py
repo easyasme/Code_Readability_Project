@@ -1,80 +1,318 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-import json
-import pprint
 
-# 3-party module
-try:
-    import uniout
-except ImportError, e:
-    pass
+"""IO tools
+============================
 
+This script groups IO related tools
 
-DEBUG_OID_ORG_MAP = False
+"""
 
-
-class OidOrgMap(object):
-    def __init__(self):
-        self._id_name_map = {}
-        self._name_id_map = {}
-
-    def add_org(self, oid, name):
-        if DEBUG_OID_ORG_MAP:
-            print 'ADD      %s  (%s)' % (oid, name)
-
-        self._id_name_map[oid] = name
-        self._name_id_map[name] = oid
-
-    def iter_org_names(self):
-        for name in self._name_id_map:
-            yield name
-
-    def get_id_org(self, oid):
-        return self._id_name_map.get(oid, '')
-
-    def get_org_id(self, org_name):
-        return self._name_id_map.get(org_name, '')
-
-    def is_known_org(self, org_name):
-        return org_name in self._name_id_map
-
-    def show_oid_map(self):
-        print '----------------------'
-        pprint.pprint(self._id_name_map)
-        print '----------------------'
-        pprint.pprint(self._name_id_map)
+import sys
+import os
+import stap
+import jinja2
 
 
-def trace_oid_tree(oid_tree, callback):
-    assert callable(callback)
-    callback(oid_tree['oid'], oid_tree['name'])
+@stap.d.enable
+@stap.d.linux("3.11")
+@stap.d.arg("--limit", "-l", default=20, type=int, metavar="N",
+            help="display N top processes")
+@stap.d.arg("--by-command", action="store_true",
+            help="aggregate using command line instead of PID")
+@stap.d.arg("--sort", "-s",
+            choices=["reads", "writes",
+                     "rbytes", "wbytes",
+                     "tio", "tbytes"],
+            default="tbytes",
+            help="sort results using the specified metric")
+def top(options):
+    """iotop-like tool.
 
-    for child in oid_tree.get('children', []):
-        trace_oid_tree(child, callback)
+    Display top users of IO disks. Those are IO as seen from the VFS
+    point of view.
+
+    """
+    probe = jinja2.Template(ur"""
+global ioreads, iowrites, breads, bwrites, all;
+
+probe vfs.read.return {
+    breads[{{pid}},cmdline_str()] += bytes_read;
+    ioreads[{{pid}},cmdline_str()] += 1;
+}
+
+probe vfs.write.return {
+    bwrites[{{pid}},cmdline_str()] += bytes_written;
+    iowrites[{{pid}},cmdline_str()] += 1;
+}
+
+function human_bytes:string(bytes:long) {
+    return sprintf("%sB/s", bytes_to_string(bytes));
+}
+function human_iops:string(iops:long) {
+    prefix = " ";
+    if (iops > 10000000000) {
+      prefix = "G";
+      iops /= 10000000000;
+    } else if (iops > 1000000) {
+      iops /= 10000000;
+      prefix = "M";
+    } else if (iops > 10000) {
+      iops /= 1000;
+      prefix = "K";
+    }
+    return sprintf("%d%s/s", iops, prefix);
+}
+function average:string(bytes:long, iops:long) {
+    if (iops == 0) return "-";
+    return bytes_to_string(bytes/iops);
+}
+
+probe timer.s(1) {
+    foreach ([t,s] in breads) {
+      tbreads += breads[t,s];
+{%- if options.sort in ["rbytes", "tbytes"] %}
+      all[t,s] += breads[t,s];
+{%- endif %}
+    }
+    foreach ([t,s] in bwrites) {
+      tbwrites += bwrites[t,s];
+{%- if options.sort in ["wbytes", "tbytes"] %}
+      all[t,s] += bwrites[t,s];
+{%- endif %}
+    }
+    foreach ([t,s] in ioreads) {
+      tioreads += ioreads[t,s];
+{%- if options.sort in ["reads", "tio"] %}
+      all[t,s] += ioreads[t,s];
+{%- endif %}
+    }
+    foreach ([t,s] in iowrites) {
+      tiowrites += iowrites[t,s];
+{%- if options.sort in ["writes", "tio"] %}
+      all[t,s] += iowrites[t,s];
+{%- endif %}
+    }
+    ansi_clear_screen();
+    printf("Total read:  %10s / %10s (avg req size: %10s) \n",
+       bytes_to_string(tbreads), human_iops(tioreads),
+       average(tbreads, tioreads));
+    printf("Total write: %10s / %10s (avg req size: %10s) \n",
+       bytes_to_string(tbwrites), human_iops(tiowrites),
+       average(tbwrites, tiowrites));
+    ansi_set_color2(30, 46);
+    printf("{% if not options.by_command %}%5s {% endif %}%10s %10s %8s %10s %10s %8s %-30s\n",
+{%- if not options.by_command %}
+      "PID",
+{%- endif %}
+      "RBYTES/s", "READ/s", "rAVG",
+      "WBYTES/s", "WRITE/s", "wAVG", "COMMAND");
+    ansi_reset_color();
+    foreach ([t,s] in all- limit {{ options.limit }}) {
+      cmd = substr(s, 0, 30);
+      printf("{% if not options.by_command %}%5d {% endif %}%10s %10s %8s %10s %10s %8s %s\n",
+{%- if not options.by_command %}
+        t,
+{%- endif %}
+        human_bytes(breads[t,s]),
+        human_iops(ioreads[t,s]),
+        average(breads[t,s], ioreads[t,s]),
+        human_bytes(bwrites[t,s]),
+        human_iops(iowrites[t,s]),
+        average(bwrites[t,s], iowrites[t,s]),
+        cmd);
+    }
+    delete all;
+    delete ioreads;
+    delete iowrites;
+    delete breads;
+    delete bwrites;
+}
+""")
+    pid = "pid()"
+    if options.by_command:
+        pid = "0"
+    probe = probe.render(options=options, pid=pid).encode("utf-8")
+    stap.execute(probe, options)
 
 
-def build_oid_org_map(oid_tree_json):
-    oo_map = OidOrgMap()
+@stap.d.enable
+@stap.d.linux("3.11")
+@stap.d.arg_pid
+@stap.d.arg_process
+@stap.d.arg("--limit", "-l", default=20, type=int, metavar="N",
+            help="display N top processes")
+@stap.d.arg("--sort", "-s",
+            choices=["reads", "writes", "total"],
+            default="total",
+            help="sort results using the specified metric")
+def files(options):
+    """Display most read/written files.
 
-    with open(oid_tree_json) as fp:
-        oid_tree = json.load(fp)
-        trace_oid_tree(oid_tree, oo_map.add_org)
+    The filename is only available when opening the file. If the
+    displayed filename is an inode number, you need to search it
+    yourself on the file system.
+    """
+    probe = jinja2.Template(ur"""
+global files%, all, ioreads, iowrites, breads, bwrites;
 
-    if DEBUG_OID_ORG_MAP:
-        oo_map.show_oid_map()
+probe generic.fop.open {
+    if (!{{ options.condition }}) next;
+    files[dev,ino] = filename;
+}
 
-    return oo_map
+function fname:string(dev:long, ino:long) {
+    try {
+      if (files[dev,ino] != "") return files[dev,ino];
+      return sprintf("dev:%d ino:%d", dev, ino);
+    } catch {
+      return "?????";
+    }
+}
+
+probe vfs.read.return {
+    if (!{{ options.condition }}) next;
+    breads[fname(dev, ino)] += bytes_read;
+    ioreads[fname(dev, ino)] += 1;
+}
+
+probe vfs.write.return {
+    if (!{{ options.condition }}) next;
+    bwrites[fname(dev, ino)] += bytes_written;
+    iowrites[fname(dev, ino)] += 1;
+}
+
+function human_bytes:string(bytes:long) {
+    return sprintf("%sB/s", bytes_to_string(bytes));
+}
+function human_iops:string(iops:long) {
+    prefix = " ";
+    if (iops > 10000000000) {
+      prefix = "G";
+      iops /= 10000000000;
+    } else if (iops > 1000000) {
+      iops /= 10000000;
+      prefix = "M";
+    } else if (iops > 10000) {
+      iops /= 1000;
+      prefix = "K";
+    }
+    return sprintf("%d%s/s", iops, prefix);
+}
+
+probe timer.s(1) {
+{%- if options.sort in ["reads", "total"] %}
+    foreach (f in breads) all[f] += breads[f];
+{%- endif %}
+{%- if options.sort in ["writes", "total"] %}
+    foreach (f in bwrites) all[f] += bwrites[f];
+{%- endif %}
+    ansi_clear_screen();
+    ansi_set_color2(30, 46);
+    printf("%10s %10s %10s %10s %-40s\n",
+      "RBYTES/s", "READ/s",
+      "WBYTES/s", "WRITE/s", "FILE");
+    ansi_reset_color();
+    foreach (f in all- limit {{ options.limit }}) {
+      file = f;
+      if (strlen(file) > 40) {
+        file = sprintf("%s…%s", substr(f, 0, 10), substr(f, strlen(f) - 29, strlen(f)));
+      }
+      printf("%10s %10s %10s %10s %s\n",
+        human_bytes(breads[f]),
+        human_iops(ioreads[f]),
+        human_bytes(bwrites[f]),
+        human_iops(iowrites[f]),
+        file);
+    }
+    delete all;
+    delete ioreads;
+    delete iowrites;
+    delete breads;
+    delete bwrites;
+}
+""")
+    probe = probe.render(options=options).encode("utf-8")
+    stap.execute(probe, options)
 
 
-def self_test():
-    oid_tree_json = '../raw_data/oid.tree.lite.json'
+@stap.d.enable
+@stap.d.linux("4.1")
+@stap.d.arg("-T", "--timestamp", action="store_true",
+            help="include timestamp on output")
+@stap.d.arg("--queue", "-Q", action="store_true",
+            help="include OS queued time in IO time")
+@stap.d.arg("--milliseconds", "-m", action="store_true",
+            help="millisecond histogram")
+@stap.d.arg("interval", nargs="?", default=99999999,
+            type=int,
+            help="output interval, in seconds")
+@stap.d.arg("count", nargs="?", default=99999999,
+            type=int,
+            help="number of outputs")
+def latency(options):
+    """Summarize block device I/O latency as a histogram.
 
-    oo_map = build_oid_org_map(oid_tree_json)
-    assert isinstance(oo_map, OidOrgMap)
+    This is a port of Brendan Gregg's biolatency tool available here:
+     https://github.com/iovisor/bcc/blob/master/tools/biolatency
+    """
+    probe = jinja2.Template(ur"""
+global count;
+global latency_stats;
+global start%;
 
-    oo_map.show_oid_map()
+{%- if options.queue %}
+probe kernel.function("blk_account_io_start") {
+    start[@choose_defined($rq,$req)] = gettimeofday_us();
+}
+{%- else %}
+probe kernel.function("blk_start_request") {
+    start[@choose_defined($rq,$req)] = gettimeofday_us();
+}
+probe kernel.function("blk_mq_start_request") {
+    start[@choose_defined($rq,$req)] = gettimeofday_us();
+}
+{% endif %}
+
+probe kernel.function("blk_account_io_completion") {
+    s = start[@choose_defined($rq,$req)];
+    if (s == 0) {
+        next;
+    }
+    delta = gettimeofday_us() - s;
+{%- if options.milliseconds %}
+    delta /= 1000;
+{%- endif %}
+    delete start[@choose_defined($rq,$req)];
+
+    latency_stats <<< delta;
+}
+
+function display_histogram() {
+{%- if options.timestamp %}
+    t = gettimeofday_s();
+    println(ctime(t));
+{%- endif %}
+    if (@count(latency_stats)) {
+        print(@hist_log(latency_stats));
+    }
+    delete latency_stats;
+    delete start;
+}
+
+probe timer.s({{ options.interval }}) {
+    display_histogram();
+    if (++count >= {{ options.count }}) {
+        exit();
+    }
+}
+
+probe end {
+    display_histogram();
+}
+""")
+    probe = probe.render(options=options).encode("utf-8")
+    stap.execute(probe, options)
 
 
-if __name__ == '__main__':
-    DEBUG_OID_ORG_MAP = True
-    self_test()
+stap.run(sys.modules[__name__])

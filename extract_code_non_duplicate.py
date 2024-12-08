@@ -53,7 +53,7 @@ def collect_code_snippets(max_files=500):
     page = 1
     per_page = 100
 
-    output_directory = 'extracted_codes_python3'
+    output_directory = 'extracted_codes_python'
     os.makedirs(output_directory, exist_ok=True)
 
     # Get existing files and identify missing numbers
