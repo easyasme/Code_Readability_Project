@@ -5,12 +5,12 @@ import csv
 import zipfile
 import shutil
 
-import style_guide_adherence
-import name_quality
-import comment_ratio
-import complexity
-import maxlinesfeature
-import readability_score
+import features.style_guide_adherence as style_guide_adherence
+import features.name_quality as name_quality
+import features.comment_ratio as comment_ratio
+import features.complexity as complexity
+import features.maxlinesfeature as maxlinesfeature
+import features.readability_score as readability_score
 
 if __name__ == '__main__':
     if len(sys.argv) > 1:
