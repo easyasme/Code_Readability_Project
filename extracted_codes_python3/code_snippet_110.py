@@ -1,0 +1,299 @@
+#!/usr/bin/python
+"""
+wp is a tool to change your background, and generate a colour scheme for your 
+ shell, and window manager. 
+"""
+
+# TODO get 8 colours, and generate a slightly lighter version!!!
+# TODO change background, but not colours
+
+import sys
+import os
+import signal
+import ConfigParser
+import shutil
+
+import colour
+import config
+
+import random
+
+from generic import output, error, debug, enumerate_choices, in_list_upper
+import applicationwrappers
+
+def sigint_handler( signal_int, frame ):
+    # pylint: disable=W0613
+    """
+    Instead of having to CTRL-C a number of times when wanting to exit a script,
+     globally handle a SIGINT by calling sigint_handler, which displays a 
+     message and exits the program, with an error status code. 
+    
+    http://stackoverflow.com/questions/1112343/how-do-i-capture-sigint-in-python
+    """
+    print
+    error("User cancelled operation(s). ")
+    error("Now exiting. ")
+    sys.exit(1)
+
+
+def populate_from_array(settings_array, config_file, 
+                        config_file_key, error_str):
+    """
+    If the value stored in config_file at the specified config_file_key, in 
+     config.WP_CONFIG_SECTION, matches a value in settings_array, return it. 
+     If the value is not found, or if there is an error reading the config_file,
+     return None, and output an error. 
+
+    We wrap all our error handling in here to make it easier (and safer) to add
+     new sections, which can call this function, instead of having to add this
+     code manually
+    """
+
+    try:
+        config_file_value = config_file.get(config.WP_CONFIG_SECTION, 
+                                            config_file_key)
+
+        for val in settings_array:
+            if config_file_value == val.get_short_name():
+                return val
+        # if we reach this far, it's not valid!
+        raise Exception()
+    except:
+        error("No valid " + error_str + " in config, please run setup again. ")
+        return None
+
+def populate_settings():
+    """
+    Populate the settings from the config file, exiting if any errors occur. 
+     We store all settings in a global point of access - config.Userconfig. 
+    """
+    config_file = ConfigParser.ConfigParser()
+    config_file.read(config.WP_CONFIG_FILE)
+
+    config.Userconfig.WM    = populate_from_array(applicationwrappers.WM,   
+                                            config_file, 
+                                            config.WM_CONFIG_KEY, 
+                                            "window manager")
+    config.Userconfig.BG    = populate_from_array(applicationwrappers.BG,   
+                                            config_file, 
+                                            config.BG_CONFIG_KEY, 
+                                            "background manager")
+    config.Userconfig.SHELL = populate_from_array(applicationwrappers.SHELL,
+                                            config_file, 
+                                            config.SH_CONFIG_KEY, 
+                                            "shell")
+
+    # if any of our variables are None, we've hit a non-existent value,
+    #  therefore exit. 
+    if any(x == None for x in 
+                        [config.Userconfig.WM,
+                         config.Userconfig.BG, 
+                         config.Userconfig.SHELL]):
+        sys.exit(1)
+
+
+def setup():
+    """
+    Write to our config file. Accept either command-line options, or 
+     interactively get user input. 
+    """
+    poss_bgs    = [bg.get_short_name()    for bg in applicationwrappers.BG]
+    poss_shs    = [ s.get_short_name()    for s  in applicationwrappers.SHELL]
+    poss_wms    = [wm.get_short_name()    for wm in applicationwrappers.WM]
+
+    if len(sys.argv) == 5:
+        new_wm = in_list_upper(sys.argv[2], poss_wms, 
+                                "Invalid Window Manager")
+        new_bg = in_list_upper(sys.argv[3], poss_bgs, 
+                                "Invalid Background Manager")
+        new_sh = in_list_upper(sys.argv[4], poss_shs, 
+                                "Invalid Shell")
+
+    else:
+        wm_int = int(enumerate_choices(poss_wms))
+        new_wm  = applicationwrappers.WM[wm_int].get_short_name()
+
+        bg_int = int(enumerate_choices(poss_bgs))
+        new_bg  = applicationwrappers.BG[bg_int].get_short_name()
+
+        sh_int = int(enumerate_choices(poss_shs))
+        new_sh  = applicationwrappers.SHELL[sh_int].get_short_name()
+
+    if not any(new_val == None for new_val in [new_wm, new_bg, new_sh]):
+        if not os.path.exists(config.WP_DIRECTORY):
+            os.makedirs(config.WP_DIRECTORY)
+        with open(config.WP_CONFIG_FILE, 'w+') as config_file_:
+
+            config_file = ConfigParser.RawConfigParser()
+            config_file.add_section(config.WP_CONFIG_SECTION)
+
+            config_file.set(config.WP_CONFIG_SECTION, 
+                            config.WM_CONFIG_KEY, new_wm)
+            config_file.set(config.WP_CONFIG_SECTION, 
+                            config.BG_CONFIG_KEY, new_bg)
+            config_file.set(config.WP_CONFIG_SECTION, 
+                            config.SH_CONFIG_KEY, new_sh)
+            
+            config_file.write(config_file_)
+            output("New setup: {} {} {}".format(new_wm, new_bg, new_sh))
+            output("Note that you may need to run `wp refresh` if you have"
+                 + " any existing files")
+
+
+def usage():
+    """
+    Output the different options the tools allows.
+    """
+    # pylint: disable=C0301
+    output("Usage: {0}".format(sys.argv[0]))
+    output("            setup   [WM BGM SHELL]      Run setup, with optional Window_manager, Background_manager and Shell")
+    output("            add     file1 [file2 ...]   Add file(s), and generate metadata files")
+    output("            refresh                     Regenerate all metadata for images in " + config.WP_DIRECTORY)
+    output("            help                        List all possible arguments to setup")
+
+def is_image_file(image_path):
+    """
+    Determine whether a file is an image, as denoted by its file extension. 
+    """
+    _, ext = os.path.splitext(image_path)
+    return ext in config.ALLOWED_FILE_EXTS
+
+
+# TODO don't bother adding files if they already exist
+def add_file(old_path):
+    """
+    Add a file to the config folder, and write all the config files. 
+    """
+    path      = config.WP_DIRECTORY + "/" + os.path.basename(old_path)
+
+    output("Adding file {}".format(os.path.basename(old_path)))
+
+    if not os.path.exists(path):
+        shutil.copy(old_path, path)
+
+    colours = colour.get_colours(path)
+
+    # TODO WM.write_colours_to_file()
+
+    config.Userconfig.WM.write_colours_to_file(colours, 
+        os.path.basename(old_path))
+    config.Userconfig.SHELL.write_colours_to_file(colours, 
+        os.path.basename(old_path))
+
+def images_from_directory(path):
+    """
+    Given a directory, grab all image files
+    """
+    # would be so much easier in Haskell...
+    onlyfiles = [f for f in os.listdir(path) 
+                    if os.path.isfile( os.path.join(path, f) ) ]
+
+    return [f for f in onlyfiles if is_image_file(f) ]
+
+def change_background():
+    """
+    Change the background to a random image from the config directory.
+
+    TODO: make it so it doesn't go to the same background in a row
+    """
+    images = images_from_directory(config.WP_DIRECTORY)
+    new_bg = random.choice(images)
+
+    joined = os.path.join(config.WP_DIRECTORY, new_bg)
+
+    config.Userconfig.BG.change_background(joined)
+
+    __path = config.Userconfig.SHELL.get_path(joined)
+    if not os.path.exists(__path):
+        output("Note: No metadata found, generating now")
+        add_file(os.path.join(config.WP_DIRECTORY, new_bg))
+
+    config.Userconfig.SHELL.on_background_change(joined)
+    config.Userconfig.WM.on_background_change(joined)
+    output("Changed background to " + new_bg)
+
+def display_help():
+    # pylint: disable=C0103
+    """
+    Display the help message, which is for the setup() command. Other commands
+     /should/ be self explanatory. 
+    """
+    output("Possible WMs:")
+    for wm in applicationwrappers.WM:
+        output("  {}".format(wm.get_short_name()))
+    
+    output("Possible BGs:")
+    for bg in applicationwrappers.BG:
+        output("  {}".format(bg.get_short_name()))
+    
+    output("Possible SHs:")
+    for sh in applicationwrappers.SHELL:
+        output("  {}".format(sh.get_short_name()))
+
+def add_images(files):
+    """
+    Given a list of files, add all images to the config directory. 
+    """
+    filtered = [f for f in files if is_image_file(f) ]
+
+    if len(filtered) > 0:
+        for arg in filtered:
+            add_file(arg)
+    else:
+        error("Please enter some files to add")
+
+def handle_cmd(cmd):
+    """
+    Call appropriate functions that match with the command the user issued after
+     wp. 
+     i.e. wp setup -> setup()
+    """
+    if cmd == "setup":
+        setup()
+    else:
+        if os.path.isdir(config.WP_DIRECTORY):
+            if not os.path.exists(config.WP_CONFIG_FILE):
+                setup()
+        else:
+            os.makedirs(config.WP_DIRECTORY)
+            setup()
+        # do rest of 'switch' statement
+
+        populate_settings()
+        
+        if cmd == "add":
+            add_images(sys.argv[2:])
+        elif cmd == "change":
+            change_background()
+        elif cmd == "refresh":
+            images = images_from_directory(config.WP_DIRECTORY)
+            output("Refreshing {} files, this could take some time. "
+                    .format(len(images)))
+            add_images(images)
+        elif cmd == "help":
+            display_help()
+        else:
+            error("Invalid command. ")
+            usage()
+
+def main():
+    """
+    Run the wp tool, which then delegates control to handle_cmd() or usage() as
+     appropriate.
+    """
+    # if we ever get an interrupt, call our own handler
+    signal.signal(signal.SIGINT, sigint_handler)
+
+    debug('Number of arguments: {} arguments.'.format(str(len(sys.argv))))
+    debug('Argument List: {}'.format(str(sys.argv)))
+
+    if len(sys.argv) > 1:
+        handle_cmd(sys.argv[1].lower())
+    else:
+        usage()
+
+if __name__ == "__main__":
+    main()
+
+
+

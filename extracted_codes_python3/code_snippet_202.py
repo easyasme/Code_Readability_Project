@@ -1,0 +1,816 @@
+#!/usr/bin/env python3
+
+import sys
+import inspect
+import argparse
+import ipaddress
+import socket
+import os
+import json
+import subprocess
+import re
+import tempfile
+import hashlib
+import struct
+import time
+import datetime
+
+COLOR_NORMAL="[0m"
+COLOR_RED="[1;31m"
+COLOR_YELLOW="[1;33m"
+COLOR_GREEN="[1;32m"
+COLOR_BWHITE="[1;37m"
+
+fs_types = set(["ext3", "ext4", "xfs", "zfs"])
+
+
+class CmdError(Exception):
+    def __init__(self, msg, exitcode, stderr):
+        self.exitcode = exitcode
+        self.stderr = stderr
+        super().__init__(msg)
+
+
+def cmd(cmd, input=None, env=None, raise_err=True, env_clean=False,
+        auto_decode=True):
+    """
+    Run command `cmd` in a shell.
+
+    `input` (string) is passed in the process' STDIN.
+
+    If `env` (dict) is given, the environment is updated with it. If
+    `env_clean` is `True`, the subprocess will start with a clean environment
+    and not inherit the current process' environment. `env` is still applied.
+
+    If `raise_err` is `True` (default), a `CmdError` is raised when the return
+    code is not zero.
+
+    Returns a dictionary:
+
+        {
+          'stdout': <string>,
+          'stderr': <string>,
+          'exitcode': <int>
+        }
+
+    If `auto_decode` is True, both `stdout` and `stderr` are automatically
+    decoded from the system default encoding to unicode strings. This will fail
+    if the output is not in that encoding (e.g. it contains binary data).
+    Otherwise, stdout and stderr are of type `<bytes>`.
+    """
+    p_env = {}
+    if env_clean is False:
+        p_env.update(os.environ)
+    if env is not None:
+        p_env.update(env)
+
+    p = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         env=p_env)
+    stdout, stderr = p.communicate(input)
+
+    if auto_decode is True:
+        stdout = stdout.decode(sys.getdefaultencoding())
+        stderr = stderr.decode(sys.getdefaultencoding())
+
+    if p.returncode != 0 and raise_err is True:
+        msg = "Command '{}' returned with exit code {}".format(cmd,
+                                                               p.returncode)
+        raise CmdError(msg, p.returncode, stderr)
+
+    return {
+        'stdout': stdout,
+        'stderr': stderr,
+        'exitcode': p.returncode
+    }
+
+
+def json_flatten(doc, prefix=""):
+    if isinstance(doc, list):
+        for i, v in enumerate(doc):
+            json_flatten(v, "{}[{}]".format(prefix, i))
+    elif isinstance(doc, dict):
+        for k, v in doc.items():
+            json_flatten(v, "{}.{}".format(prefix, k))
+    else:
+        sys.stdout.write("{} = {}\n".format(prefix.lstrip(".").lower(), doc))
+
+
+def gb(kbytes, ndigits=1):
+    return round(kbytes / 1024 / 1024, ndigits)
+
+
+class Subcommand:
+    """
+    Base class from which subcommands should inherit.
+    """
+    subcommand = None
+    short_desc = None
+
+    def __init__(self, args):
+        self.args = args
+
+    @classmethod
+    def config_parser(cls, parser):
+        pass
+
+    def run(self):
+        sys.stdout.write("Running '{}' with args: {}\n".format(self.subcommand, self.args))
+
+
+class Netconn(Subcommand):
+    subcommand = "netconn"
+    short_desc = "Net connection test"
+    long_desc = "Perform connection test to an IP or hostname and optional port."
+
+    @classmethod
+    def config_parser(cls, parser):
+        parser.description = cls.long_desc
+        parser.add_argument("host")
+        parser.add_argument('port', nargs='?', metavar='PORT', type=int, default=None, help='Port')
+        parser.add_argument('data', nargs='?', metavar='DATA', type=str, default=None, help='Data to send')
+        parser.add_argument('-t', '--timeout', metavar='TIMEOUT', type=int, default=2, help='Socket timeout')
+
+    def run(self):
+        try:
+            host = self.args.host
+            self._host_info(host)
+        except Exception as err:
+            sys.stderr.write("'{}' is not a hostname: {}\n".format(self.args.host, err))
+            raise
+
+    def _host_info(self, host):
+        raw_ip = socket.gethostbyname(host)
+        if not isinstance(raw_ip, str):
+            ip = raw_ip.decode("utf8")
+        else:
+            ip = raw_ip
+        hostname, aliases, ips = socket.gethostbyname_ex(host)
+        rem_ips = None
+        try:
+            rem_ips = subprocess.check_output("dig @1.1.1.1 +short {}".format(host), shell=True).decode("utf-8").strip()
+        except subprocess.CalledProcessError as err:
+            rem_ips = "{}{}{}".format(COLOR_RED, err, COLOR_NORMAL)
+
+        sys.stdout.write("hostname: {}\n".format(hostname))
+        sys.stdout.write("aliasses: {}\n".format(", ".join(aliases)))
+        sys.stdout.write("ips (local dns): {}\n".format(", ".join(ips)))
+        sys.stdout.write("ips (public dns): {}\n".format(rem_ips))
+
+        for ip in ips:
+            self._ip_info(ipaddress.ip_address(ip), hostname, self.args)
+
+    def _ip_info(self, ip, hostname, args):
+        try:
+            dnsname, aliases, ips = socket.gethostbyaddr(ip.exploded)
+            if dnsname == hostname:
+                sys.stdout.write("{}: reversehostname: {}{}{}\n".format(ip.exploded, COLOR_GREEN, dnsname, COLOR_NORMAL))
+            else:
+                sys.stdout.write("{}: reversehostname: {}{}{}\n".format(ip.exploded, COLOR_YELLOW, dnsname, COLOR_NORMAL))
+        except Exception as err:
+            sys.stderr.write("{}: reversehostname: {}{}{}\n".format(ip.exploded, COLOR_RED, err, COLOR_NORMAL))
+
+        self._ip_ping(ip)
+        if self.args.port is not None:
+            self._port_connect(ip, self.args.port, self.args.data)
+
+    def _ip_ping(self, ip):
+        sys.stdout.write("{}: ping: ".format(ip.exploded))
+        sys.stdout.flush()
+
+        response = os.system("ping -c 1 -W 2 " + ip.exploded + " > /dev/null")
+        if response == 0:
+            sys.stdout.write("{}response received{}\n".format(COLOR_GREEN, COLOR_NORMAL))
+        else:
+            sys.stderr.write("{}no response received{}\n".format(COLOR_RED, COLOR_NORMAL))
+
+    def _port_connect(self, ip, port, data):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(self.args.timeout)
+        sys.stdout.write("{}:{}: socket: connecting...\n".format(ip.exploded, port))
+        try:
+            # Connect
+            s.connect((ip.exploded, port))
+            sys.stdout.write("{}:{}: socket: {}connected{} (something is listening there)\n".format(ip.exploded, args.port, COLOR_GREEN, COLOR_NORMAL))
+
+            # Send data
+            if data is not None:
+                sys.stdout.write("{}:{}: socket: sending data: {}\n".format(ip.exploded, port, data))
+                s.send(bytes(data + "\n", 'utf-8'))
+
+            # Receive data
+            try:
+                sys.stdout.write("{}:{}: socket: receiving data...\n".format(ip.exploded, port))
+                sys.stdout.flush()
+                buf = s.recv(4096)
+                sys.stdout.write("{}:{}: socket: {}received data{}:\n".format(ip.exploded, port, COLOR_GREEN, COLOR_NORMAL))
+                try:
+                    buf_str = buf.decode('utf-8')
+                    for line in buf_str.splitlines():
+                        sys.stdout.write("  | {}\n".format(line))
+                except UnicodeDecodeError as err:
+                    sys.stdout.buffer.write(b"  | ")
+                    sys.stdout.buffer.write(buf)
+                    sys.stdout.buffer.write(b"\n")
+            except Exception as err:
+                sys.stdout.write("{}:{}: socket: {}no data recieved{}: {}\n".format(ip.exploded, port, COLOR_RED, COLOR_NORMAL, err))
+
+            # Close connection
+            s.close()
+            sys.stdout.write("{}:{}: socket: connection closed.\n".format(ip.exploded, port))
+        except Exception as err:
+            sys.stdout.write("{}:{}: socket: {}couldn't connect to socket{}: {}\n".format(ip.exploded, port, COLOR_RED, COLOR_NORMAL, err))
+
+
+
+class MyIP(Subcommand):
+    subcommand = "myip"
+    short_desc = "Show info on external IP"
+    long_desc = "Show info on the outgoing external IP of the current host."
+
+    @classmethod
+    def config_parser(cls, parser):
+        parser.description = cls.long_desc
+
+    def get(self):
+        info = os.popen('timeout 2 curl -4 -s ifconfig.co/json').read()
+        try:
+            j = json.loads(info)
+        except json.decoder.JSONDecodeError:
+            j = {}
+        return j
+
+    def run(self):
+        j =  self.get()
+        sys.stdout.write("ip: {}\n".format(j.get("ip", "??")))
+        sys.stdout.write("hostname: {}\n".format(j.get("hostname", "??")))
+        sys.stdout.write("country: {}\n".format(j.get("country", "??")))
+        sys.stdout.write("city: {}\n".format(j.get("city", "??")))
+
+
+class SysInfo(Subcommand):
+    subcommand = "sysinfo"
+    short_desc = "Show system info"
+    long_desc = "Show system information such as disk space and CPUs"
+
+    @classmethod
+    def config_parser(cls, parser):
+        parser.description = cls.long_desc
+
+    def get_processors(self):
+        procs = []
+        with open("/proc/cpuinfo", "r") as f:
+            proc = {}
+            for line in f:
+                if line == "" or line == "\n":
+                    procs.append(proc)
+                    proc = {}
+                else:
+                    fields = line.split(":", 1)
+                    key = fields[0].strip()
+                    value = fields[1].strip()
+                    proc[key] = value
+        return procs
+
+    def get_load(self):
+        with open("/proc/loadavg", "r") as f:
+            avg_1, avg_5, avg_15, rest = f.readline().split(" ", 3)
+        return {
+            "avg_1": avg_1,
+            "avg_5": avg_5,
+            "avg_15": avg_15
+        }
+
+    def get_mem(self):
+        mem = {}
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                key, value = map(lambda x: x.strip(), line.split(":", 1))
+                if value.endswith(" kB"):
+                    value = value[:-3]
+                value = float(value)
+                mem[key] = value
+
+        mem_info = {
+            "mem_total": gb(mem["MemTotal"]),
+            "mem_used": gb(mem["MemTotal"] - mem["MemFree"] - mem["Buffers"] - mem["Cached"]),
+            "mem_free": gb(mem["MemFree"]),
+            "mem_avail": "",
+            "mem_buffers": gb(mem["Buffers"]),
+            "mem_cached": gb(mem["Cached"] + mem["SReclaimable"]),
+            "mem_bufcache": gb(mem["Buffers"] + mem["Cached"]),
+            "swap_total": gb(mem["SwapTotal"]),
+            "swap_used": gb(mem["SwapTotal"] - mem["SwapFree"]),
+            "swap_free": gb(mem["SwapFree"]),
+        }
+        if 'MemAvailable' in mem:
+            mem_info["mem_avail"] = gb(mem["MemAvailable"])
+
+        return mem_info
+
+    def get_disks(self):
+        disks = []
+        with open("/proc/mounts", "r") as f:
+            for line in f:
+                dev, mntpoint, fstype, options = line.split(" ", 3)
+                if fstype in fs_types:
+                    try:
+                        diskstat = os.statvfs(mntpoint)
+                        size = diskstat.f_blocks * diskstat.f_frsize
+                        free = diskstat.f_bavail * diskstat.f_frsize
+                        reserved = size * 0.05
+                        used = size - free - reserved
+                        disk = {
+                            "dev": dev,
+                            "mntpoint": mntpoint,
+                            "fstype": fstype,
+                            "size": gb(size / 1024, 1),
+                            "reserved": gb(reserved / 1024, 1),
+                            "free": gb(free / 1024, 1),
+                            "used": gb(used / 1024, 1),
+                        }
+                        disks.append(disk)
+                    except PermissionError as err:
+                        if err.errno == 13:
+                            # permission denied
+                            pass
+        return disks
+
+
+    def get_os(self):
+        os_info = {
+            'family': 'unknown',
+            'os': 'unknown',
+            'version': ('0', '0'),
+            'codename': None,
+        }
+
+        if os.path.exists('/etc/lsb-release'):
+            with open('/etc/lsb-release', 'r') as f:
+                for line in f:
+                    if line.strip() == "":
+                        continue
+                    key, value = line.strip().split('=', 1)
+                    if key == 'DISTRIB_ID':
+                        os_info['os'] = value.strip('"\' ').lower()
+                        if value.lower().startswith('ubuntu'):
+                            os_info['family'] = 'debian'
+                    if key == 'DISTRIB_RELEASE':
+                        os_info['version'] = value
+                    if key == 'DISTRIB_CODENAME':
+                        os_info['codename'] = value
+
+        if os.path.exists('/etc/os-release'):
+            with open('/etc/os-release', 'r') as f:
+                for line in f:
+                    if line.strip() == "":
+                        continue
+                    key, value = line.strip().split('=', 1)
+                    if key == 'ID_LIKE':
+                        os_info['family'] = value.strip('"\'').lower()
+                    elif key == 'ID':
+                        os_info['os'] = value.strip('"\'').lower()
+                    elif key == 'VERSION_ID':
+                        version = value.strip('"\'').split('.')
+                        if len(version) > 1:
+                            os_info['version'] = (str(version[0]), str(version[1]))
+                        else:
+                            os_info['version'] = (str(version[0]), '0')
+
+        if os.path.exists('/etc/redhat-release'):
+            os_reg = re.compile(r'^(.*?) release (\d+)\.(\d+).*$')
+            os_info['family'] = 'redhat'
+            with open('/etc/redhat-release', 'r') as f:
+                for line in f:
+                    if line.strip() == "":
+                        continue
+                    match = os_reg.match(line)
+                    if match:
+                        if 'centos' in match.groups()[0].lower():
+                            os_info['os'] = 'centos'
+                        elif 'red hat' in match.groups()[0].lower():
+                            os_info['os'] = 'redhat'
+                        if len(match.groups()) > 1:
+                            os_info['version'] = (str(match.groups()[1]),
+                                                  str(match.groups()[2]))
+                        else:
+                            os_info['version'] = (str(version[0]), '0')
+
+        return os_info
+
+    def get_ips(self):
+        ips = set()
+        prev_line = ''
+        with open('/proc/net/fib_trie', 'r') as f:
+            for line in f:
+                if '32 host' in line:
+                    ip = prev_line.strip().split()[-1]
+                    ips.add(ip)
+                prev_line = line
+        return ips
+
+    def bar(self, total, used):
+        if total == 0:
+            return ""
+        bar_used = (used / total) * 20
+        bar_free = 20 - bar_used
+        bar_used_str = round(bar_used) * "┃"
+        bar_free_str = round(bar_free) * "┃"
+        return COLOR_RED + bar_used_str + COLOR_GREEN + bar_free_str + COLOR_NORMAL
+
+    def run(self):
+        os = self.get_os()
+        processors = self.get_processors()
+        load = self.get_load()
+        mem = self.get_mem()
+        disks = self.get_disks()
+        ips = self.get_ips()
+        myip = MyIP(None).get()
+
+        os_codename = ""
+        if os["codename"] != "":
+            os_codename = " ({})".format(os["codename"])
+        sys.stdout.write("OS:        {} ({}) v{}{}\n".format(os["os"], os["family"], ".".join(os["version"]), os_codename))
+        sys.stdout.write("CPU:       {} x {}\n".format(len(processors), processors[-1]["model name"]))
+        sys.stdout.write("Load:      {} {} {}\n".format(load["avg_1"], load["avg_5"], load["avg_15"]))
+        sys.stdout.write("\n")
+
+        sys.stdout.write("Local IPs: {}\n".format(", ".join(sorted(ips))))
+        sys.stdout.write("Out IP:    {}   {} ({}, {})\n".format(myip.get("ip", "??"), myip.get("hostname", "??"), myip.get("city", "?"), myip.get("country", "?")))
+        sys.stdout.write("\n")
+
+        sys.stdout.write("{}             Total       Used      Avail    Buffers     Cached       Free     Mnt{}\n".format(COLOR_BWHITE, COLOR_NORMAL))
+        sys.stdout.write("Mem:    {:8} G {:8}   {:8} G {:8} G {:8} G {:8} G {:22} {}\n".format(mem["mem_total"], "", mem["mem_avail"], mem["mem_buffers"], mem["mem_cached"], mem["mem_free"], " ", self.bar(mem["mem_total"], mem["mem_total"] - mem["mem_avail"])))
+        sys.stdout.write("Swap:   {:8} G {:8} G {:8} G {:55} {}\n".format(mem["swap_total"], mem["swap_used"], mem["swap_free"], "", self.bar(mem["swap_total"], mem["swap_used"])))
+
+        for disk in disks:
+            sys.stdout.write("Disk:   {:8} G {:8} G {:8} G                                      {:18} {}\n".format(disk["size"], disk["used"], disk["free"], disk["mntpoint"][:18], self.bar(disk["size"], disk["used"])))
+
+
+class SSLInfo(Subcommand):
+    subcommand = "sslinfo"
+    short_desc = "Show info on SSL cert/key/etc files"
+    long_desc = "Show info on SSL cert/key/etc files"
+
+    @classmethod
+    def config_parser(cls, parser):
+        parser.description = cls.long_desc
+        parser.add_argument('files', nargs='+', metavar='FILES', type=str, default=None, help='Files')
+
+    def proc_pem_part(self, pem_part):
+        if pem_part.strip().startswith("-----BEGIN CERTIFICATE REQUEST-----"):
+            self.proc_pem_csr(pem_part)
+        elif pem_part.strip().startswith("-----BEGIN CERTIFICATE-----"):
+            self.proc_pem_crt(pem_part)
+        elif pem_part.strip().startswith("-----BEGIN PRIVATE KEY-----"):
+            self.proc_pem_key(pem_part)
+        elif pem_part.strip().startswith("-----BEGIN RSA PRIVATE KEY-----"):
+            self.proc_pem_key(pem_part)
+        else:
+            sys.stdout.write("Unknown format\n")
+            return
+
+    def proc_pem_csr(self, pem_part):
+        cmd = "openssl req -in '{fname}' -text -noout"
+        pem_info = self.call_openssl_tmp(cmd, pem_part)
+        sys.stdout.write("    Subject:              {}\n".format(pem_info.get("Subject", "")))
+        sys.stdout.write("    Public Key Algorithm: {}\n".format(pem_info.get("Public Key Algorithm", "")))
+        sys.stdout.write("    RSA Public-Key:       {}\n".format(pem_info.get("RSA Public-Key", "")))
+        sys.stdout.write("    Signature Algorithm:  {}\n".format(pem_info.get("Signature Algorithm", "")))
+
+    def proc_pem_crt(self, pem_part):
+        cmd = "openssl x509 -in '{fname}' -text -noout"
+        pem_info = self.call_openssl_tmp(cmd, pem_part)
+        sys.stdout.write("    Subject:      {}\n".format(pem_info.get("Subject", "")))
+        sys.stdout.write("    Issuer:       {}\n".format(pem_info.get("Issuer", "")))
+        sys.stdout.write("    Not After:    {}\n".format(pem_info.get("Not After", "")))
+        sys.stdout.write("    Modulus Hash: {}\n".format(pem_info.get("ModulusHash", "")))
+        if pem_info.get("IsRoot", False):
+            sys.stdout.write("    Is Root:      {}Yes{}\n".format(COLOR_RED, COLOR_NORMAL))
+
+    def proc_pem_key(self, pem_part):
+        cmd = "openssl rsa -in '{fname}' -text -noout"
+        pem_info = self.call_openssl_tmp(cmd, pem_part)
+        sys.stdout.write("    RSA Private-Key: {}\n".format(pem_info.get("RSA Private-Key", "")))
+        sys.stdout.write("    Modulus Hash:    {}\n".format(pem_info.get("ModulusHash", "")))
+
+    def call_openssl_tmp(self, cmd, tmp_buf):
+        with tempfile.NamedTemporaryFile() as fp:
+            fp.write(tmp_buf.encode('utf8'))
+            fp.flush()
+            proc = subprocess.run(
+                cmd.format(fname=fp.name),
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if proc.returncode != 0:
+                sys.stderr.write("openssl returned: {}\n".format(proc.stderr))
+                return
+
+        pem_info = {}
+        lines = proc.stdout.decode("utf8").splitlines()
+        for i in range(len(lines)):
+            line = lines[i]
+            if "Serial Number:" in line:
+                pem_info["Serial Number"] = lines[i+1].strip()
+                i += 1
+            if "modulus:" in line.lower():
+                modulus = ""
+                while True:
+                    next_line = lines[i+1]
+                    if next_line.strip()[0] not in "0123456789abcdef":
+                        break
+                    modulus += next_line.strip()
+                    i += 1
+                pem_info["ModulusHash"] = hashlib.md5(modulus.encode("ascii")).hexdigest().upper()
+            elif ":" in line:
+                key, rest = line.strip().split(":", 1)
+                pem_info[key.strip()] = rest.strip()
+
+        # Check if it's a root certificate
+        if pem_info.get("Subject", "") == pem_info.get("Issuer", "NOT EMPTY"):
+            pem_info["IsRoot"] = True
+
+        return pem_info
+
+    def file_info(self, file):
+        buf = ""
+        in_cert = False
+        with open(file, "r") as fh:
+            part = 0
+            for line in fh:
+                if line.startswith('-----BEGIN'):
+                    in_cert = True
+                    print("  {} (PEM format)".format(line[11:-6].capitalize()))
+                elif line.startswith('-----END'):
+                    buf += line
+                    # process
+                    part += 1
+                    sys.stdout.write("  {}part {}{}\n".format(COLOR_YELLOW, part, COLOR_NORMAL))
+                    pem_info = self.proc_pem_part(buf)
+                    in_cert = False
+                    buf = ""
+
+                if in_cert:
+                    buf += line
+
+    def run(self):
+        for file in self.args.files:
+            sys.stdout.write("{}{}{}\n".format(COLOR_GREEN, file, COLOR_NORMAL))
+            self.file_info(file)
+
+
+class Docker(Subcommand):
+    subcommand = "docker"
+    short_desc = "Unix-friendly docker inspect"
+    long_desc = "Dump a flattened version of docker inspect for all containers"
+
+    @classmethod
+    def config_parser(cls, parser):
+        parser.description = cls.long_desc
+
+    def docker_get_container_ids(self):
+        result = cmd("docker ps -a --format '{{.ID}}'")
+        return [line.strip() for line in result["stdout"].splitlines()]
+
+    def docker_get_inspect(self, container_ids):
+        result = cmd("docker inspect {}".format(container_ids))
+        return result["stdout"]
+
+    def run(self):
+        container_ids = " ".join(self.docker_get_container_ids())
+        container_info = json.loads(self.docker_get_inspect(container_ids))
+        for container in container_info:
+            json_flatten(container, "{}:{}".format(container["Id"][:12], container["Name"][1:]))
+
+
+class Diag(Subcommand):
+    subcommand = "diag"
+    short_desc = "Diagnose common linux problems"
+    long_desc = "Diagnose network, dns, etc problems"
+
+    @classmethod
+    def config_parser(cls, parser):
+        parser.description = cls.long_desc
+
+    def _get_gateway(self):
+        """
+        Read the default gateway directly from /proc.
+        https://stackoverflow.com/questions/2761829/python-get-default-gateway-for-a-local-interface-ip-address-in-linux
+        """
+        with open("/proc/net/route") as fh:
+            for line in fh:
+                fields = line.strip().split()
+                if fields[1] != '00000000' or not int(fields[3], 16) & 2:
+                    # If not default route or not RTF_GATEWAY, skip it
+                    continue
+
+                return socket.inet_ntoa(struct.pack("<L", int(fields[2], 16)))
+
+    def _ping(self, host):
+        return os.system("ping -c 1 " + host)
+
+    def run(self):
+        default_gw = self._get_gateway()
+        sys.stdout.write("Checking local network: ")
+        sys.stdout.write("Pinging default gateway {}: ".format(default_gw))
+        sys.stdout.flush()
+        if os.system("ping -c 1 -w 1 {} > /dev/null".format(default_gw)) == 0:
+            sys.stdout.write("{}Ok{}\n".format(COLOR_GREEN, COLOR_NORMAL))
+        else:
+            sys.stdout.write("{}Nack{}\n".format(COLOR_RED, COLOR_NORMAL))
+
+        sys.stdout.write("Checking internet access: ")
+        sys.stdout.write("Pinging 8.8.8.8: ")
+        sys.stdout.flush()
+        if os.system("ping -c 1 -w 1 8.8.8.8 > /dev/null") == 0:
+            sys.stdout.write("{}Ok{}\n".format(COLOR_GREEN, COLOR_NORMAL))
+        else:
+            sys.stdout.write("{}Nack{}\n".format(COLOR_RED, COLOR_NORMAL))
+
+        sys.stdout.write("Checking DNS resolving: ")
+        sys.stdout.write("Resolving www.example.org: ")
+        sys.stdout.flush()
+        try:
+            ip = socket.gethostbyname('www.example.org')
+            sys.stdout.write("{}Ok{}\n".format(COLOR_GREEN, COLOR_NORMAL))
+        except socket.gaierror as err:
+            sys.stdout.write("{}Nack{}: {}\n".format(COLOR_RED, COLOR_NORMAL, err))
+
+        sys.stdout.write("Checking failed systemd services: ")
+        res = cmd("systemctl --failed --plain --no-legend")
+        if res["stdout"]:
+            sys.stdout.write("{}Nack{}: Some services are in failed state:\n".format(COLOR_RED, COLOR_NORMAL))
+            for line in res["stdout"].splitlines():
+                sys.stdout.write("    {}\n".format(line))
+        else:
+            sys.stdout.write("{}Ok{}\n".format(COLOR_GREEN, COLOR_NORMAL))
+
+
+class Json(Subcommand):
+    subcommand = "json"
+    short_desc = "Do stuff with json"
+    long_desc = "Pretty-print, flatten and other json stuff"
+
+    @classmethod
+    def config_parser(cls, parser):
+        parser.description = cls.long_desc
+        parser.add_argument(
+            '-i','--indent',
+            dest="indent",
+            type=int,
+            action="store",
+            default=4,
+            help="Indent level. 0 will output a single line"
+
+        )
+        parser.add_argument(
+            '-l', '--lines',
+            dest="lines",
+            action="store_true",
+            default=False,
+            help="Treat input as json lines"
+        )
+        parser.add_argument(
+            '-f', '--flatten',
+            dest="flatten",
+            action="store_true",
+            default=False,
+            help="Flatten output"
+        )
+        parser.add_argument(
+            'input',
+            metavar='INPUT',
+            type=str,
+            nargs='?',
+            default=None,
+            help="File to read from. If ommitted, read from stdin"
+        )
+
+
+    def run(self):
+        # Figure out the filehandle to read from (stdin or a file)
+        fh = None
+        if sys.stdin.isatty():
+            if self.args.input is None:
+                sys.stderr.write("The INPUT argument is required if no data is provided on stdin.\n")
+                sys.exit(1)
+            else:
+                fh = open(self.args.input)
+        else:
+            fh = sys.stdin
+
+        if self.args.lines:
+            # Treat as "JSON Lines" (each line is a seperate JSON object)
+            for line in fh.readlines():
+                self.output(json.loads(line))
+        else:
+            self.output(json.load(fh))
+
+    def output(self, data):
+        if self.args.flatten is True:
+            json_flatten(data)
+        elif self.args.indent == 0:
+            json.dump(data, sys.stdout)
+            sys.stdout.write("\n")
+        else:
+            json.dump(data, sys.stdout, indent=self.args.indent)
+            sys.stdout.write("\n")
+
+
+class watch(Subcommand):
+    subcommand = "watch"
+    short_desc = "Watch process output"
+    long_desc = "Periodically execute command and show its output"
+
+    @classmethod
+    def config_parser(cls, parser):
+        parser.description = cls.long_desc
+        parser.add_argument(
+            '-i','--interval',
+            dest="interval",
+            type=int,
+            action="store",
+            default=1000,
+            help="Interval in miliseconds"
+        )
+        parser.add_argument(
+            '-n', '--no-ts',
+            dest="notimestamp",
+            action="store_true",
+            default=False,
+            help="Disable timestamps"
+        )
+        parser.add_argument(
+            '-o', '--one-line',
+            dest="oneline",
+            action="store_true",
+            default=False,
+            help="Force one line (escape newlines)"
+        )
+        parser.add_argument(
+            'cmd',
+            metavar='CMD',
+            type=str,
+            help="Command to run"
+        )
+
+
+    def run(self):
+        try:
+            while True:
+                output = ""
+
+                if self.args.notimestamp is False:
+                    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    output += now + " "
+
+                try:
+                    now = time.time()
+                    res = cmd(self.args.cmd)
+                    elapsed = time.time() - now
+                except CmdError as err:
+                    output += "e:{}".format(err.exitcode) + " " + err.stderr
+                else:
+                    output += "t:{:5.2f} e:{}".format(elapsed, res["exitcode"]) + " " + res["stdout"]
+
+                if self.args.oneline:
+                    output = output.replace("\n", "\\n").replace("\r", "\\r") + "\n"
+
+                if not output.endswith("\n"):
+                    output += "\n"
+
+                sys.stdout.write(output)
+                sys.stdout.flush()
+
+                time.sleep(self.args.interval / 1000)
+        except KeyboardInterrupt:
+            sys.exit(0)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='OmniTool')
+    parser.add_argument('--version', action='version', version='%(prog)s 0.1')
+
+    bin_name = os.path.basename(sys.argv[0])
+    parser.prog = bin_name
+
+    # Construct subparsers for all subcommands
+    subparsers = parser.add_subparsers()
+    for member in inspect.getmembers(sys.modules[__name__], inspect.isclass):
+        member_name, member_class = member
+        if getattr(member_class, 'subcommand', None) is not None:
+            subcommand = member_class.subcommand
+            shortdesc = member_class.short_desc
+            subparser = subparsers.add_parser(subcommand, help=shortdesc)
+            member_class.config_parser(subparser)
+            subparser.set_defaults(cls=member_class)
+
+    args = parser.parse_args()
+    if hasattr(args, 'cls'):
+        subcommand_instance = args.cls(args)
+        subcommand_instance.run()
+    else:
+        sys.stderr.write("Specify a subcommand\n")
+        sys.exit(1)
