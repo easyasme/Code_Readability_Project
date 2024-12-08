@@ -1,114 +1,210 @@
-#!/usr/bin/env python
+import os
+import pytest
+import numpy as np
+from functools import wraps
+from nano_graphrag import GraphRAG
+from nano_graphrag._storage import Neo4jStorage
+from nano_graphrag._utils import wrap_embedding_func_with_attrs
 
-from BNfinder.MDL import MDL
-from BNfinder.MIT import MIT
-from BNfinder.BDE import BDE
-from BNfinder.data import dataset
-from BNfinder import util
-    
-if __name__=="__main__":
-    import sys
-    #from dispatch import *
-    #test(int(sys.argv[1]),int(sys.argv[2]),int(sys.argv[3]))
-    from optparse import OptionParser
-    parser = OptionParser()
-    parser.add_option("-s", "--score", dest="score",default="BDE",help="Scoring function: BDE (default) or MDL or MIT")
-    parser.add_option("-d", "--data-factor", dest="df",default=1.0,type=float,help="Factor multiplying the data set")
-    parser.add_option("-e", "--expr", dest="expr",help="Expression data file (can be used with other data types as well)")
-    parser.add_option("-t", "--txt", dest="txt",help="Output file with the suboptimal parents sets")
-    parser.add_option("-n", "--net", dest="net",help="Output file with the network structure")
-    parser.add_option("-c", "--cpd", dest="cpd",help="Output file with the conditional probability distributions")
-    parser.add_option("-b", "--bif", dest="bif",help="Output file with the optimal network in BIF format")
-    parser.add_option("-v", "--verbose", dest="verbose", action="store_true", default=False, help="Print comments")
-    parser.add_option("-p", "--prior-pseudocount", dest="prior",help="Total pseudocount number in Dirichlet priors of BDE score (default: 1 pseudocount for each possible value vector)")
-    parser.add_option("-i", "--suboptimal", dest="n_min", default=1, type=int,help="Number of computed suboptimal parents sets")
-    parser.add_option("-m", "--min-empty", dest="min_empty", default=None, type=float,help="Reported suboptimal parents sets' minimal probability ratio to the empty set")
-    parser.add_option("-o", "--min-optimal", dest="min_optim", default=None, type=float,help="Reported suboptimal parents sets' minimal probability ratio to the optimal set")
-    parser.add_option("-l", "--limit", dest="limit",help="Limit of the size of parents subsets")
-    parser.add_option("-f", "--fraction", dest="frac", type=float,default=None,help="Minimum weight of a parent to be considered in a parent set.")
-    parser.add_option("-r", "--fpr", dest="fpr", type=float, default=None, help="Type I error rate (expected proportion of false positive edges; procedure is switched off when not specified)")
-    parser.add_option("-x", "--max-permutations", dest="max_tries", type=int, default=None, help="Maximal number of permutations in type I error rate predetermination")
-    parser.add_option("-a", "--chi", dest="chi", type=float, default=.9999, help="alpha value for the chi-square distribution used in MIT score (default=.9999)")
-    parser.add_option("-g", "--sloops", dest="sloops", action='store_true', default=False, help="Allow self-loops in Dynamic Bayesian Networks (no self-loops by default)")
-    parser.add_option("-k", "--cpu", dest="cores", type=int, default=0, help="Number of cores to use for parallelization")
-    parser.add_option("-j", "--subset", dest="subset", help="Input file with subset of variables (divided by space character). The feature is useful when the inference complexity is too high, allowing distributed usage of BNFinder. After all the variables are processed (including regulators), put resulting 'genes_*' files into one folder and use 'concat' instead of file name. If only particular variables are subject for parents set inference it is advisable to simply edit input data file instead of using this argument")
-    parser.add_option("-q", "--algorithm", dest="alg", default="setwise", help="Parallelization algorithm: 'setwise' (default, uses each provided core to compute parents set of one variable before proceeding further) or 'hybrid' (evenly distributes cores between variables, it is recommended to use when underlying network is supposed to be homogeneous with respect to the number of parents per variable, in cases when computational complexity is low or small parents set limit is used)")
+if os.environ.get("NANO_GRAPHRAG_TEST_IGNORE_NEO4J", False):
+    pytest.skip("skipping neo4j tests", allow_module_level=True)
 
-    (options, args) = parser.parse_args()
 
-    if options.expr==None:
-        print "You must provide an expression file name. Run bnf --help for more options."
-    else:
-        if options.verbose:
-            print 'Loading data from:', options.expr, '...',
-        try:
-            d =  dataset(options.expr).fromNewFile(open(options.expr))
-        except KeyError:
-            if options.verbose:
-                print "Not a new file format. The old format is deprecated!"
-            d = dataset(options.expr).fromFile(open(options.expr))
-            
-#        if any([x.n_disc==0 for x in d.vertices]) and options.score=="MIT":
-#            print "\n\nERROR: the MIT score is not compatible with continuous variables"
-#            sys.exit()
-            
+@pytest.fixture(scope="module")
+def neo4j_config():
+    return {
+        "neo4j_url": os.environ.get("NEO4J_URL", "bolt://localhost:7687"),
+        "neo4j_auth": (
+            os.environ.get("NEO4J_USER", "neo4j"),
+            os.environ.get("NEO4J_PASSWORD", "neo4j"),
+        ),
+    }
 
-        if options.verbose:
-            print 'done\nLearning network ', d.name,' with', options.score, 'scoring function'
 
-        score=eval(options.score)(data_factor=options.df,prior=options.prior,chi_alpha=options.chi,sloops=options.sloops)
-        score,g,subpars = d.learn(score=score,\
-                        data_factor=options.df,\
-                        prior=options.prior,\
-                        verbose=options.verbose,\
-                        n_min=options.n_min,\
-                        limit=options.limit,\
-                        min_empty=options.min_empty,\
-                        min_optim=options.min_optim,\
-                        cores=options.cores,\
-                        alg=options.alg,\
-                        subset=options.subset,\
-                        fpr=options.fpr,
-                        max_tries=options.max_tries,)
-        if options.verbose:
-            print 'Total score of optimal network:',score
-            print g.to_SIF()
-            #print g.to_SIF(subpars)
+@wrap_embedding_func_with_attrs(embedding_dim=384, max_token_size=8192)
+async def mock_embedding(texts: list[str]) -> np.ndarray:
+    return np.random.rand(len(texts), 384)
 
-        if options.txt:
-            d.write_txt(subpars,options.txt)
-            if options.verbose:
-                print "Suboptimal parents sets written to:", options.txt
-            
-        if options.net:
-            if options.n_min==1:
-                net_str=g.to_SIF()
-            else:
-                net_str=g.to_SIF(subpars)
-            f=open(options.net,"w")
-            f.write(net_str)
-            f.close()
-            #g.toDot().write_dot(options.net)
-            if options.verbose:
-                print "Network graph written to:", options.net
-                print net_str
-                
-        if options.cpd:
-            f_cpd=open(options.cpd,"w")
-            #d.write_cpd(g,f_cpd,options.prior)
-            #f_cpd.write("XXXXXXXXXXXXXXXXX\n")
-            #print "XXXXX",repr(options.frac)
-            if options.frac:
-                g1=g.weighted_edges(subpars,float(options.frac))
-                util.pprint(f_cpd,d.to_cpd(g1,options.prior))
-            else: #outpu the best network
-                util.pprint(f_cpd,d.to_cpd(g,options.prior))
-            f_cpd.close()
-            if options.verbose:
-                print "Conditional probability distributions written to:", options.cpd
-            
-        if options.bif:
-            d.write_bif(g,options.bif,options.prior,\
-                ['Network graph learned with %s scoring function from expression data file \'%s\'' %(options.score,options.expr)])
-            if options.verbose:
-                print "Bayesian network written to:", options.bif
+
+@pytest.fixture
+def neo4j_storage(neo4j_config):
+    rag = GraphRAG(
+        working_dir="./tests/neo4j_test",
+        embedding_func=mock_embedding,
+        graph_storage_cls=Neo4jStorage,
+        addon_params=neo4j_config,
+    )
+    storage = rag.chunk_entity_relation_graph
+    return storage
+
+
+def reset_graph(func):
+    @wraps(func)
+    async def new_func(neo4j_storage):
+        await neo4j_storage._debug_delete_all_node_edges()
+        await neo4j_storage.index_start_callback()
+        results = await func(neo4j_storage)
+        await neo4j_storage._debug_delete_all_node_edges()
+        return results
+
+    return new_func
+
+
+def test_neo4j_storage_init():
+    rag = GraphRAG(
+        working_dir="./tests/neo4j_test",
+        embedding_func=mock_embedding,
+    )
+    with pytest.raises(ValueError):
+        storage = Neo4jStorage(
+            namespace="nanographrag_test", global_config=rag.__dict__
+        )
+
+
+@pytest.mark.asyncio
+@reset_graph
+async def test_upsert_and_get_node(neo4j_storage):
+    node_id = "node1"
+    node_data = {"attr1": "value1", "attr2": "value2"}
+    return_data = {"id": node_id, "clusters": "[]", **node_data}
+
+    await neo4j_storage.upsert_node(node_id, node_data)
+
+    result = await neo4j_storage.get_node(node_id)
+    assert result == return_data
+
+    has_node = await neo4j_storage.has_node(node_id)
+    assert has_node is True
+
+
+@pytest.mark.asyncio
+@reset_graph
+async def test_upsert_and_get_edge(neo4j_storage):
+    source_id = "node1"
+    target_id = "node2"
+    edge_data = {"weight": 1.0, "type": "connection"}
+
+    await neo4j_storage.upsert_node(source_id, {})
+    await neo4j_storage.upsert_node(target_id, {})
+    await neo4j_storage.upsert_edge(source_id, target_id, edge_data)
+
+    result = await neo4j_storage.get_edge(source_id, target_id)
+    print(result)
+    assert result == edge_data
+
+    has_edge = await neo4j_storage.has_edge(source_id, target_id)
+    assert has_edge is True
+
+
+@pytest.mark.asyncio
+@reset_graph
+async def test_node_degree(neo4j_storage):
+    node_id = "center"
+    await neo4j_storage.upsert_node(node_id, {})
+
+    num_neighbors = 5
+    for i in range(num_neighbors):
+        neighbor_id = f"neighbor{i}"
+        await neo4j_storage.upsert_node(neighbor_id, {})
+        await neo4j_storage.upsert_edge(node_id, neighbor_id, {})
+
+    degree = await neo4j_storage.node_degree(node_id)
+    assert degree == num_neighbors
+
+
+@pytest.mark.asyncio
+@reset_graph
+async def test_edge_degree(neo4j_storage):
+    source_id = "node1"
+    target_id = "node2"
+
+    await neo4j_storage.upsert_node(source_id, {})
+    await neo4j_storage.upsert_node(target_id, {})
+    await neo4j_storage.upsert_edge(source_id, target_id, {})
+
+    num_source_neighbors = 3
+    for i in range(num_source_neighbors):
+        neighbor_id = f"neighbor{i}"
+        await neo4j_storage.upsert_node(neighbor_id, {})
+        await neo4j_storage.upsert_edge(source_id, neighbor_id, {})
+
+    num_target_neighbors = 2
+    for i in range(num_target_neighbors):
+        neighbor_id = f"target_neighbor{i}"
+        await neo4j_storage.upsert_node(neighbor_id, {})
+        await neo4j_storage.upsert_edge(target_id, neighbor_id, {})
+
+    expected_edge_degree = (num_source_neighbors + 1) + (num_target_neighbors + 1)
+    edge_degree = await neo4j_storage.edge_degree(source_id, target_id)
+    assert edge_degree == expected_edge_degree
+
+
+@pytest.mark.asyncio
+@reset_graph
+async def test_get_node_edges(neo4j_storage):
+    center_id = "center"
+    await neo4j_storage.upsert_node(center_id, {})
+
+    expected_edges = []
+    for i in range(3):
+        neighbor_id = f"neighbor{i}"
+        await neo4j_storage.upsert_node(neighbor_id, {})
+        await neo4j_storage.upsert_edge(center_id, neighbor_id, {})
+        expected_edges.append((center_id, neighbor_id))
+
+    result = await neo4j_storage.get_node_edges(center_id)
+    print(result)
+    assert set(result) == set(expected_edges)
+
+
+@pytest.mark.asyncio
+@reset_graph
+async def test_leiden_clustering(neo4j_storage):
+    for i in range(10):
+        await neo4j_storage.upsert_node(f"NODE{i}", {"source_id": f"chunk{i}"})
+
+    for i in range(9):
+        await neo4j_storage.upsert_edge(f"NODE{i}", f"NODE{i+1}", {"weight": 1.0})
+
+    await neo4j_storage.clustering(algorithm="leiden")
+
+    community_schema = await neo4j_storage.community_schema()
+
+    assert len(community_schema) > 0
+
+    for community in community_schema.values():
+        assert "level" in community
+        assert "title" in community
+        assert "edges" in community
+        assert "nodes" in community
+        assert "chunk_ids" in community
+        assert "occurrence" in community
+        assert "sub_communities" in community
+        print(community)
+
+
+@pytest.mark.asyncio
+@reset_graph
+async def test_nonexistent_node_and_edge(neo4j_storage):
+    assert await neo4j_storage.has_node("nonexistent") is False
+    assert await neo4j_storage.has_edge("node1", "node2") is False
+    assert await neo4j_storage.get_node("nonexistent") is None
+    assert await neo4j_storage.get_edge("node1", "node2") is None
+    assert await neo4j_storage.get_node_edges("nonexistent") == []
+    assert await neo4j_storage.node_degree("nonexistent") == 0
+    assert await neo4j_storage.edge_degree("node1", "node2") == 0
+
+
+@pytest.mark.asyncio
+@reset_graph
+async def test_cluster_error_handling(neo4j_storage):
+    with pytest.raises(
+        ValueError, match="Clustering algorithm invalid_algo not supported"
+    ):
+        await neo4j_storage.clustering("invalid_algo")
+
+
+@pytest.mark.asyncio
+@reset_graph
+async def test_index_done(neo4j_storage):
+    await neo4j_storage.index_done_callback()

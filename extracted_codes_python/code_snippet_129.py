@@ -1,300 +1,267 @@
-# importing all packages used with the program
-import os
-
-from flask_sqlalchemy import SQLAlchemy
-from werkzeug.security import generate_password_hash, check_password_hash
-from flask_login import UserMixin, LoginManager, login_required, current_user, login_user, logout_user
-from flask import Flask, render_template, request, redirect, session, flash
-
-from produce import *
-
-# initialises the web application
-app = Flask(__name__)
-app.secret_key = 'xyz'
-
-# establishes connection for database
-basedir = os.path.abspath(os.path.dirname(__file__))
-app.config['SQLALCHEMY_DATABASE_URI'] = \
-    'sqlite:///' + os.path.join(basedir, 'database.db')
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
-db = SQLAlchemy(app)
-
-# initialise the login packages
-login = LoginManager()
-login.login_view = 'login'
-login.init_app(app)
-
-
-# creates a user class used to create a database table
-class User(UserMixin, db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(80), unique=True)
-    username = db.Column(db.String(100), nullable=False)
-    password_hash = db.Column(db.String(), nullable=False)
-
-    diary = db.relationship('Diary', backref='user', lazy=True, passive_deletes=True)
-    age = db.Column(db.Integer)
-    weight = db.Column(db.Integer)
-    height = db.Column(db.Integer)
-
-    def set_password(self, password):
-        self.password_hash = generate_password_hash(password)
-
-    def check_password(self, password):
-        return check_password_hash(self.password_hash, password)
-
-
-# creates a diary class used to create a database table
-class Diary(UserMixin, db.Model):
-    entryID = db.Column(db.Integer, primary_key=True)
-    title = db.Column(db.String(50))
-    description = db.Column(db.String(100))
-    step_count = db.Column(db.Integer)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'),
-                        nullable=False)
-
-
-# migrate script would be copied in here
-
-
-@login.user_loader
-def load_user(id):
-    return User.query.get(int(id))
-
-
-# base page users instantly land on
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-
-# about page
-@app.route('/about')
-def about():
-    return render_template('about.html')
-
-
-# login page
-@app.route('/login', methods=['POST', 'GET'])
-def login():
-    """encase users are already logged in we don't want them accessing this page,
-     so they will instantly be routed back to the home page"""
-    if current_user.is_authenticated:
-        return redirect('/')
-    # when the submit button is pressed this script will run
-    if request.method == 'POST':
-        # takes the data from the page
-        email = request.form['email']
-        user = User.query.filter_by(email=email).first()
-        # checks the password is correct using the method created earlier
-        if user is not None and user.check_password(request.form['password']):
-            login_user(user)
-            return redirect('/')
-        else:
-            flash('Invalid password provided', 'error')
-
-    return render_template('login.html')
-
-
-# register page
-@app.route('/register', methods=['POST', 'GET'])
-def register():
-    """encase users are already logged in we don't want them accessing this page,
-     so they will instantly be routed back to the home page"""
-    if current_user.is_authenticated:
-        return redirect('/')
-    # when the submit button is pressed this script will run
-    if request.method == 'POST':
-        email = request.form['email']
-        username = request.form['username']
-        password = request.form['password']
-        if username == '':
-            flash('username is blank', 'error')
-            return redirect('/register')
-        if password == '':
-            flash('password is blank', 'error')
-            return redirect('/register')
-
-        val = password_checker(password)
-
-        if not val:
-            flash('password is needs to be longer than 6 characters, 1 upper case, 1 lower case and should have at '
-                  'least one of the symbols $@#', 'error')
-            return redirect('/register')
-
-        """creates a new user object 
-        which is then used to submit a new user to the database"""
-        user = User(email=email, username=username, age=None, weight=None, height=None)
-        if (User.query.filter_by(email=email).first()) is not None:
-            flash('Email already Present', 'error')
-            return redirect('/register')
-        user.set_password(password)
-        db.session.add(user)
-        db.session.commit()
-        return redirect('/login')
-    return render_template('register.html')
-
-
-# logout page
-@app.route('/logout')
-def logout():
-    # function from flask-login package
-    logout_user()
-    return redirect('/')
-
-
-# diary page
-@app.route('/diary', methods=['POST', 'GET'])
-@login_required
-def diary():
-    user_id = current_user.id
-    # takes all the entries from the database
-    entries = Diary.query.all()
-    return render_template('diary.html', entries=entries)
-
-
-# new entry page
-@app.route('/diary/new_entry', methods=['POST', 'GET'])
-@login_required
-def new_entry():
-    # passes data from the page to the route
-    if request.method == 'POST':
-        title = request.form['title']
-        description = request.form['description']
-        steps = request.form['steps']
-        if title == '' or description == '' or steps == '':
-            flash('please make sure all fields are filled in', 'error')
-            return redirect('/diary/new_entry')
-
-        uid = current_user.id
-        # creates a diary object which is then submitted to the database
-        entry = Diary(title=title, description=description, step_count=steps, user_id=uid)
-
-        db.session.add(entry)
-        db.session.commit()
-        return redirect('/diary')
-    return render_template('new_entry.html')
-
-
-# dashboard-location page
-@app.route('/dashboard-loc', methods=['POST', 'GET'])
-@login_required
-def dashboard_loc():
-    if request.method == 'POST':
-        # creates the location as a session object so that it can easily be used by other functions
-        session["location"] = request.form['locations']
-        if session["location"] == '':
-            flash('Invalid location provided', 'error')
-        else:
-            return redirect('/dashboard')
-    return render_template('dashboard_loc.html')
-
-
-# dashboard page
-@app.route('/dashboard')
-@login_required
-def dashboard():
-    # takes the location session
-    location = session["location"]
-    latitude, longitude = convert_lat(location)
-
-    # API used to get the temperature
-    temp_api = f'https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}' \
-               f'&hourly=temperature_2m,rain'
-
-    # API used to get different air quality details
-    air_api = f'https://air-quality-api.open-meteo.com/v1/air-quality?latitude={latitude}&longitude={longitude}' \
-              f'&hourly=pm10,pm2_5,alder_pollen,birch_pollen,grass_pollen,mugwort_pollen,olive_pollen,ragweed_pollen'
-
-    # procedures to pass info from APIs to the template
-    avg_temp = weather_api(temp_api, location, True)
-    pollen_names, pollen_averages = air_quality_api(air_api, location)
-
-    return render_template('dashboard.html', location=location, avg_temp=avg_temp,
-                           pollen_avgs=zip(pollen_names, pollen_averages))
-
-
-# donate page
-@app.route('/donate')
-def donate():
-    return render_template('donate.html')
-
-
-# allergens page
-@app.route('/allergens')
-def allergens():
-    return render_template('allergens.html')
-
-
-# pollen page
-@app.route('/allergens/pollen')
-def pollen():
-    return render_template('pollen.html')
-
-
-# dust page
-@app.route('/allergens/dust')
-def dust():
-    return render_template('dust.html')
-
-
-# pets page
-@app.route('/allergens/pets')
-def pets():
-    return render_template('pets.html')
-
-
-# smoke page
-@app.route('/allergens/smoke')
-def smoke():
-    return render_template('smoke.html')
-
-
-# asthma page
-@app.route('/allergens/asthma')
-def asthma():
-    return render_template('asthma.html')
-
-
-# weather page
-@app.route('/weather')
-def weather():
-    return render_template('weather.html')
-
-
-# script to delete a specified diary entry
-@app.route('/delete_entry/int:<entryID>')
-def delete_entry(entryID):
-    # finds the specified entry
-    entry_to_delete = Diary.query.get_or_404(entryID)
-    db.session.delete(entry_to_delete)
-    db.session.commit()
-    return redirect('/diary')
-
-
-# delete account page
-@app.route('/delete_account')
-def delete_account():
-    return render_template('delete_account.html')
-
-
-@app.route('/del_account/int:<id>')
-def del_account(id):
-    # finds the specified account
-    account_to_delete = User.query.get_or_404(id)
-    db.session.delete(account_to_delete)
-    db.session.commit()
-    return redirect('/')
-
-
-# error 404 page
-def page_not_found(e):
-    return render_template('404.html'), 404
-
-
-# assigns the page to be used when a 404 error occurs
-app.register_error_handler(404, page_not_found)
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=80, debug=True)
+from dataclasses import dataclass, field
+from typing import Literal
+
+import torch
+
+from .tokenizer import MODALITY_TOKENS, FishTokenizer
+
+CODEBOOK_PAD_TOKEN_ID = 0
+
+
+@dataclass(kw_only=True)
+class BasePart:
+    pass
+
+
+@dataclass(kw_only=True)
+class VQPart(BasePart):
+    codes: torch.Tensor
+
+
+@dataclass(kw_only=True)
+class TextPart(BasePart):
+    text: str
+
+
+@dataclass(kw_only=True)
+class EncodedMessage:
+    tokens: torch.Tensor
+    labels: torch.Tensor
+    vq_mask_tokens: torch.Tensor | None = None
+    vq_mask_labels: torch.Tensor | None = None
+    vq_parts: list[torch.Tensor]
+    vq_require_losses: torch.Tensor | None = None
+
+
+@dataclass(kw_only=True)
+class Message:
+    role: Literal["system", "user", "assistant"]
+    parts: list[VQPart | TextPart] = field(default_factory=list)
+    add_im_start: bool = True
+    add_im_end: bool = True
+    cal_loss: bool = False
+    modality: Literal["text", "voice", "interleave"] | None = None
+
+    # By default, ignore the loss of the auto-generated im_start token
+    ignore_im_start_loss: bool = True
+
+    def encode(
+        self: "Message",
+        tokenizer: FishTokenizer,
+    ) -> EncodedMessage:
+        all_tokens = []
+        all_labels = []
+
+        # Multi-modal tokens
+        vq_parts = []
+        vq_masks = []
+
+        parts = self.parts.copy()
+        if self.add_im_start:
+            modality_token = MODALITY_TOKENS[self.modality] if self.modality else ""
+            parts.insert(0, TextPart(text=f"<|im_start|>{self.role}\n{modality_token}"))
+
+        if self.add_im_end:
+            parts.append(TextPart(text="<|im_end|>"))
+
+        for part in parts:
+            if isinstance(part, TextPart):
+                tokens = torch.tensor(
+                    tokenizer.encode(part.text),
+                    dtype=torch.int,
+                )
+            elif isinstance(part, VQPart):
+                curr_codes = part.codes.clone()
+                tokens = torch.tensor(
+                    [
+                        tokenizer.semantic_id_to_token_id[i.item()]
+                        for i in curr_codes[0].int()
+                    ],
+                    dtype=torch.int,
+                )
+                vq_parts.append(curr_codes)
+            else:
+                raise ValueError(f"Unsupported part type: {type(part)}")
+
+            all_tokens.append(tokens)
+            if isinstance(part, VQPart):
+                vq_masks.append(torch.ones_like(tokens, dtype=torch.bool))
+            else:
+                vq_masks.append(torch.zeros_like(tokens, dtype=torch.bool))
+
+            if self.cal_loss:
+                all_labels.append(tokens.clone())
+            else:
+                all_labels.append(torch.full_like(tokens, -100))
+
+        tokens = torch.cat(all_tokens, dim=0)
+        labels = torch.cat(all_labels, dim=0)
+        vq_masks = torch.cat(vq_masks, dim=0)
+
+        assert tokens.shape == labels.shape == vq_masks.shape
+
+        if self.ignore_im_start_loss and self.add_im_start:
+            labels[: len(all_tokens[0])] = -100
+
+        return EncodedMessage(
+            tokens=tokens,
+            labels=labels,
+            vq_parts=vq_parts,
+            vq_mask_tokens=vq_masks,
+            vq_mask_labels=vq_masks,
+        )
+
+
+@dataclass
+class Conversation:
+    messages: list[Message]
+
+    def __init__(self: "Conversation", messages: list[Message] | None = None):
+        self.messages = messages or []
+
+    def encode(
+        self: "Conversation",
+        tokenizer: FishTokenizer,
+        add_shift: bool = True,
+        ignore_loss_tokens: list[str] = [],
+    ) -> EncodedMessage:
+        # Build the input_ids and labels
+        tokens = []
+        labels = []
+        vq_parts = []
+        vq_mask_tokens = []
+        vq_mask_labels = []
+        vq_require_losses = []
+        ignore_loss_token_ids = [tokenizer.get_token_id(i) for i in ignore_loss_tokens]
+
+        for message in self.messages:
+            encoded = message.encode(
+                tokenizer,
+            )
+            tokens.append(encoded.tokens)
+            labels.append(encoded.labels)
+            vq_parts.extend(encoded.vq_parts)
+            vq_mask_tokens.append(encoded.vq_mask_tokens)
+            vq_mask_labels.append(encoded.vq_mask_labels)
+            vq_require_losses.extend([message.cal_loss] * len(encoded.vq_parts))
+
+        tokens = torch.cat(tokens, dim=0)
+        labels = torch.cat(labels, dim=0)
+        vq_mask_tokens = torch.cat(vq_mask_tokens, dim=0)
+        vq_mask_labels = torch.cat(vq_mask_labels, dim=0)
+        vq_require_losses = torch.tensor(vq_require_losses, dtype=torch.bool)
+
+        if add_shift:
+            tokens = tokens[:-1]
+            labels = labels[1:]
+            vq_mask_tokens = vq_mask_tokens[:-1]
+            vq_mask_labels = vq_mask_labels[1:]
+
+        for i in ignore_loss_token_ids:
+            assert i != -100 and i is not None
+            labels[labels == i] = -100
+
+        assert tokens.dtype in [
+            torch.int,
+            torch.long,
+        ], f"Invalid dtype: {tokens.dtype}, conv: {conversation}"
+
+        return EncodedMessage(
+            tokens=tokens,
+            labels=labels,
+            vq_parts=vq_parts,
+            vq_mask_tokens=vq_mask_tokens,
+            vq_mask_labels=vq_mask_labels,
+            vq_require_losses=vq_require_losses,
+        )
+
+    def encode_for_inference(
+        self: "Conversation",
+        tokenizer: FishTokenizer,
+        num_codebooks: int,
+    ) -> EncodedMessage:
+        # self.visualize(tokenizer)
+
+        encoded = self.encode(tokenizer, add_shift=False)
+        tokens = encoded.tokens
+        values = torch.zeros((num_codebooks + 1, len(tokens)), dtype=torch.int)
+        values[0] = tokens
+
+        if encoded.vq_parts is None or len(encoded.vq_parts) == 0:
+            return values
+
+        vq_parts = encoded.vq_parts
+        vq_parts = [part.to(values.device) for part in vq_parts]
+        vq_parts = torch.cat(vq_parts, dim=1)
+        values[0, encoded.vq_mask_tokens] = vq_parts[0] + tokenizer.semantic_begin_id
+        values[1:, encoded.vq_mask_tokens] = vq_parts
+
+        return values
+
+    def visualize(
+        self: "Conversation",
+        tokenizer: FishTokenizer,
+        ignore_loss_tokens: list[str] = [],
+    ):
+        encoded = self.encode(
+            tokenizer, add_shift=False, ignore_loss_tokens=ignore_loss_tokens
+        )
+
+        # Colors for alternating tokens
+        colors = {
+            "blue": "\033[94m",  # Light blue
+            "cyan": "\033[96m",  # Cyan
+            "green": "\033[92m",  # Light green
+            "dark_green": "\033[32m",  # Dark green
+        }
+        blue_idx = 0
+        green_idx = 0
+
+        def print_in_blue(x):
+            nonlocal blue_idx
+            color = colors["blue"] if blue_idx % 2 == 0 else colors["cyan"]
+            print(f"{color}{x}\033[0m", end="")
+            blue_idx += 1
+
+        def print_in_green(x):
+            nonlocal green_idx
+            color = colors["green"] if green_idx % 2 == 0 else colors["dark_green"]
+            print(f"{color}{x}\033[0m", end="")
+            green_idx += 1
+
+        for tok, lab in zip(encoded.tokens, encoded.labels):
+            val = tokenizer.decode([tok])
+
+            if lab == -100:
+                print_in_green(val)
+            else:
+                print_in_blue(val)
+
+        print()
+
+    def append(self: "Conversation", message: Message):
+        self.messages.append(message)
+
+
+if __name__ == "__main__":
+    message0 = Message(
+        role="user",
+        parts=[
+            TextPart(text="Hello, how are you?"),
+            VQPart(codes=torch.zeros((4, 10))),
+        ],
+        cal_loss=False,
+    )
+
+    message1 = Message(
+        role="assistant",
+        parts=[TextPart(text="I'm fine, thank you.")],
+        cal_loss=True,
+    )
+    conversation = Conversation([message0, message1])
+    tokenizer = FishTokenizer.from_pretrained("checkpoints/Qwen2-1.5B-Instruct")
+    conversation.visualize(tokenizer)
+
+    encoded = conversation.encode(tokenizer)
+    print(encoded)
+    print(tokenizer.batch_decode(encoded.tokens))
