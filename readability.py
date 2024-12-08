@@ -49,7 +49,7 @@ if __name__ == '__main__':
                         except Exception as e:
                             print(f"Error processing file {file_path}: {e}")
                             continue
-            output_file = "code_readability.csv"
+            output_file = "code_pypi_readability.csv"
             with open(output_file, mode="w", newline="", encoding="utf-8") as file:
                 writer = csv.writer(file)
                 writer.writerows(data)
