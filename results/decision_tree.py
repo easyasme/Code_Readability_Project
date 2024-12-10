@@ -66,3 +66,18 @@ plot_grid_search_results(results_df, 'param_min_samples_split', 'param_min_sampl
 
 # Plot criterion vs max_depth
 plot_grid_search_results(results_df, 'param_criterion', 'param_max_depth')
+
+def show_feature_importances(model, feature_names):
+    importances = model.feature_importances_
+    indices = np.argsort(importances)[::-1]
+    plt.figure(figsize=(8, 6))
+    plt.bar(range(len(feature_names)), importances[indices], align='center', color='skyblue')
+    plt.xticks(range(len(feature_names)), [feature_names[i] for i in indices], rotation=45, ha='right')
+    plt.title("Feature Importances")
+    plt.xlabel("Feature")
+    plt.ylabel("Importance")
+    plt.tight_layout()
+    plt.show()
+
+best_model = dt_grid_search.best_estimator_
+show_feature_importances(best_model, X.columns)
